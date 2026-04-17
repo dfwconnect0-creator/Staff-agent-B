@@ -1,32 +1,29 @@
-name: Daily Briefing
+name: Ingest Telegram Replies
 
 on:
   schedule:
-    - cron: "0 5 * * *"   # 5 AM UTC = 8 AM Cairo
+    - cron: "0 */2 * * *"   # every 2 hours
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  brief:
+  ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 3
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --frozen
-      - run: uv run python src/briefing.py
+      - run: uv run python src/ingest_replies.py
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      - name: Commit new memory
+      - name: Commit ingested replies
         run: |
           git config user.name "chief-of-staff-bot"
           git config user.email "bot@users.noreply.github.com"
           git add memory/episodic/
-          git diff --staged --quiet || git commit -m "memory: briefing for $(date -u +%Y-%m-%d)"
+          git diff --staged --quiet || git commit -m "memory: ingest replies $(date -u +%Y-%m-%dT%H:%M)"
           git push
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
