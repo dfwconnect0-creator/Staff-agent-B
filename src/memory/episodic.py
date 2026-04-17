@@ -28,7 +28,7 @@ def _parse_prediction(content: str) -> dict | None:
 
 
 def _parse_user_replies(content: str) -> list[dict]:
-    match = re.search(r"## User replies.*?\n\n(.*?)(?=\n## |\Z)", content, re.DOTALL)
+    match = re.search(r"## User replies[^\n]*\n+?(.*?)(?=\n## |\Z)", content, re.DOTALL)
     if not match:
         return []
     replies = []
