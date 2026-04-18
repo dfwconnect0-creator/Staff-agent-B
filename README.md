@@ -31,9 +31,19 @@ Every 2 hours, a second workflow ingests Telegram replies and appends them to th
 │       └── ...
 ├── src/
 │   ├── briefing.py       # main entrypoint
-│   ├── claude_client.py  # calls Claude, parses JSON block from response
 │   ├── telegram_client.py
 │   ├── ingest_replies.py # reads Telegram, appends to day files
+│   ├── llm/
+│   │   ├── base.py           # Provider ABC + LLMResponse type
+│   │   ├── factory.py        # get_provider() — reads env, returns provider
+│   │   ├── parsing.py        # shared JSON block extraction
+│   │   ├── retry.py          # one-shot retry on malformed JSON
+│   │   └── providers/
+│   │       ├── anthropic.py
+│   │       ├── openai_compatible.py
+│   │       ├── gemini.py
+│   │       ├── ollama.py
+│   │       └── openrouter.py
 │   └── memory/
 │       ├── episodic.py   # read/write day files
 │       └── schema.py     # JSON prediction schema + validation
@@ -82,14 +92,40 @@ After each morning briefing, Mohamed can reply in Telegram. The `ingest-replies`
 
 Replies that arrive on days without a briefing file (e.g., weekends if the briefing was skipped) go into `memory/episodic/.orphans.md`.
 
+## Choosing a provider
+
+The agent supports four LLM providers. Set `LLM_PROVIDER` to select one:
+
+| Provider | Env var | Default model |
+|---|---|---|
+| `anthropic` | `ANTHROPIC_API_KEY` | `claude-opus-4-6` |
+| `gemini` | `GEMINI_API_KEY` | `gemini-2.5-flash-lite` |
+| `ollama` | `OLLAMA_API_KEY` | `gpt-oss:120b-cloud` |
+| `openrouter` | `OPENROUTER_API_KEY` | `google/gemini-2.5-flash-lite` |
+
+Set `LLM_MODEL` to override the default model for the chosen provider.
+
+`LLM_PROVIDER` can be set as a GitHub Actions repository variable (Settings > Variables > Actions) so you can switch providers from the GitHub UI without editing workflow YAML. Only the API key for the chosen provider needs to be set — unused secrets can be absent.
+
+If `LLM_PROVIDER` is not set, the run fails immediately with a clear error listing valid options.
+
+### Troubleshooting
+
+**What do I do if provider X returns malformed JSON?**
+
+The retry handles it automatically: the agent sends one follow-up message asking the model to return only a fenced JSON block, then parses again. If both attempts fail, the briefing still sends to Telegram but the memory file is skipped for that day (logged as "skipping memory write").
+
+If it happens persistently, check that the model is capable of following formatting instructions about fenced JSON blocks. Consider switching to a stronger default model by setting `LLM_MODEL`.
+
 ## Running locally
 
 ```bash
 uv sync
+export LLM_PROVIDER=anthropic
 export ANTHROPIC_API_KEY=...
 export TELEGRAM_BOT_TOKEN=...
 export TELEGRAM_CHAT_ID=...
-uv run python src/briefing.py
+uv run python -m src.briefing
 ```
 
 ## Running tests
@@ -104,7 +140,7 @@ Edit `context/heartbeat.md` directly to reflect what's currently in progress. Th
 
 ## Secrets required
 
-- `ANTHROPIC_API_KEY`
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 - `GITHUB_TOKEN` (auto-provided by Actions for the memory commit step)
+- One of: `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OLLAMA_API_KEY`, `OPENROUTER_API_KEY` (depending on `LLM_PROVIDER`)
