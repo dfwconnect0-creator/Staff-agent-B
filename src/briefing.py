@@ -4,8 +4,8 @@ import sys
 from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 
-from claude_client import ask_claude
-from telegram_client import send_telegram_message
+from src.claude_client import ask_claude
+from src.telegram_client import send_telegram_message
 import src.memory.episodic as episodic
 from src.memory.schema import validate_prediction
 
