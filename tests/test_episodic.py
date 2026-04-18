@@ -125,3 +125,12 @@ def test_append_reply_preserves_other_sections(tmp_path):
 def test_append_reply_raises_on_missing_file():
     with pytest.raises(FileNotFoundError):
         episodic.append_reply(date(2026, 4, 17), "2026-04-17 09:12", "yo")
+
+
+def test_write_day_file_has_closing_json_fence(tmp_path):
+    d = date(2026, 4, 17)
+    episodic.write_day(d, "briefing", VALID_PREDICTION)
+    content = (tmp_path / "2026-04-17.md").read_text()
+    # The prediction block must be a valid closed markdown code fence
+    assert content.count("```") == 2  # one open, one close
+    assert "```\n" in content.split("```json")[1]  # closing fence exists
