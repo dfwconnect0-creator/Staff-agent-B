@@ -127,6 +127,14 @@ def test_append_reply_raises_on_missing_file():
         episodic.append_reply(date(2026, 4, 17), "2026-04-17 09:12", "yo")
 
 
+def test_append_reply_uses_bold_timestamp_format(tmp_path):
+    d = date(2026, 4, 17)
+    episodic.write_day(d, "briefing", VALID_PREDICTION)
+    episodic.append_reply(d, "2026-04-17 09:12", "hello")
+    content = (tmp_path / "2026-04-17.md").read_text()
+    assert '- **2026-04-17 09:12 Cairo:** "hello"' in content
+
+
 def test_write_day_file_has_closing_json_fence(tmp_path):
     d = date(2026, 4, 17)
     episodic.write_day(d, "briefing", VALID_PREDICTION)
