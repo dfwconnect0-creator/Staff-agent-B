@@ -19,11 +19,21 @@ VALID_PREDICTION = {
     "questions_asked": ["Did you check the workflow?", "Is junior still on task?", "Energy 1-5?"],
 }
 
-MOCK_CLAUDE_RESPONSE = {
+MOCK_LLM_RESPONSE = {
     "text": "🎯 Topic finder is stuck.\n✂️ Open the workflow run.\n❓ Check it?\n❓ Junior on task?\n⚡ Energy 1-5?",
     "prediction": VALID_PREDICTION,
     "raw": "🎯 Topic finder is stuck.\n✂️ Open the workflow run.\n❓ Check it?\n❓ Junior on task?\n⚡ Energy 1-5?\n\n```json\n{...}\n```",
+    "provider": "anthropic",
+    "model": "claude-opus-4-6",
 }
+
+
+def make_mock_provider(response=None):
+    if response is None:
+        response = MOCK_LLM_RESPONSE
+    mock = MagicMock()
+    mock.complete.return_value = response
+    return mock
 
 
 @pytest.fixture(autouse=True)
@@ -40,22 +50,26 @@ def test_first_ever_run_creates_file(tmp_path):
     captured_messages = []
     captured_prompts = []
 
-    def fake_ask_claude(system_prompt, user_message):
+    mock_provider = make_mock_provider()
+    original_complete = mock_provider.complete.side_effect
+
+    def capture_complete(system_prompt, user_message):
         captured_prompts.append(user_message)
-        return MOCK_CLAUDE_RESPONSE
+        return MOCK_LLM_RESPONSE
+
+    mock_provider.complete.side_effect = capture_complete
 
     def fake_send(text):
         captured_messages.append(text)
 
-    with patch("src.briefing.ask_claude", side_effect=fake_ask_claude):
+    with patch("src.briefing.get_provider", return_value=mock_provider):
         with patch("src.briefing.send_telegram_message", side_effect=fake_send):
             import src.briefing as briefing
-            # Reload to pick up mocked env
             result = briefing.main()
 
     assert result == 0
     assert len(captured_messages) == 1
-    assert captured_messages[0] == MOCK_CLAUDE_RESPONSE["text"]
+    assert captured_messages[0] == MOCK_LLM_RESPONSE["text"]
     mem_file = tmp_path / "2026-04-17.md"
     assert mem_file.exists()
     assert "Yesterday's context" not in captured_prompts[0]
@@ -72,11 +86,15 @@ def test_second_day_includes_yesterday_verbatim(tmp_path):
 
     captured_prompts = []
 
-    def fake_ask_claude(system_prompt, user_message):
-        captured_prompts.append(user_message)
-        return MOCK_CLAUDE_RESPONSE
+    mock_provider = make_mock_provider()
 
-    with patch("src.briefing.ask_claude", side_effect=fake_ask_claude):
+    def capture_complete(system_prompt, user_message):
+        captured_prompts.append(user_message)
+        return MOCK_LLM_RESPONSE
+
+    mock_provider.complete.side_effect = capture_complete
+
+    with patch("src.briefing.get_provider", return_value=mock_provider):
         with patch("src.briefing.send_telegram_message"):
             import src.briefing as briefing
             briefing.main()
@@ -96,11 +114,15 @@ def test_yesterday_replies_included_in_prompt(tmp_path):
 
     captured_prompts = []
 
-    def fake_ask_claude(system_prompt, user_message):
-        captured_prompts.append(user_message)
-        return MOCK_CLAUDE_RESPONSE
+    mock_provider = make_mock_provider()
 
-    with patch("src.briefing.ask_claude", side_effect=fake_ask_claude):
+    def capture_complete(system_prompt, user_message):
+        captured_prompts.append(user_message)
+        return MOCK_LLM_RESPONSE
+
+    mock_provider.complete.side_effect = capture_complete
+
+    with patch("src.briefing.get_provider", return_value=mock_provider):
         with patch("src.briefing.send_telegram_message"):
             import src.briefing as briefing
             briefing.main()
@@ -116,10 +138,13 @@ def test_briefing_sends_even_when_json_fails(tmp_path, capsys):
         "text": "🎯 briefing text only",
         "prediction": None,
         "raw": "🎯 briefing text only",
+        "provider": "anthropic",
+        "model": "claude-opus-4-6",
     }
     sent = []
+    mock_provider = make_mock_provider(bad_response)
 
-    with patch("src.briefing.ask_claude", return_value=bad_response):
+    with patch("src.briefing.get_provider", return_value=mock_provider):
         with patch("src.briefing.send_telegram_message", side_effect=lambda t: sent.append(t)):
             import src.briefing as briefing
             result = briefing.main()
@@ -138,36 +163,41 @@ def test_briefing_sends_even_when_memory_read_fails(tmp_path):
 
     sent = []
     captured_prompts = []
+    mock_provider = make_mock_provider()
 
-    def fake_ask_claude(system_prompt, user_message):
+    def capture_complete(system_prompt, user_message):
         captured_prompts.append(user_message)
-        return MOCK_CLAUDE_RESPONSE
+        return MOCK_LLM_RESPONSE
 
-    with patch("src.briefing.ask_claude", side_effect=fake_ask_claude):
+    mock_provider.complete.side_effect = capture_complete
+
+    with patch("src.briefing.get_provider", return_value=mock_provider):
         with patch("src.briefing.send_telegram_message", side_effect=lambda t: sent.append(t)):
             import src.briefing as briefing
             result = briefing.main()
 
     assert result == 0
     assert len(sent) == 1
-    # When prediction is None from corrupt file, prompt falls back to no prior context
-    assert "Yesterday's context" not in captured_prompts[0] or True  # corrupt = None prediction, no section
+    assert "Yesterday's context" not in captured_prompts[0] or True
 
 
 @freeze_time("2026-04-17 06:00:00")
 def test_same_day_double_run_does_not_overwrite(tmp_path, capsys):
+    mock_provider = make_mock_provider()
+
     # First run
-    with patch("src.briefing.ask_claude", return_value=MOCK_CLAUDE_RESPONSE):
+    with patch("src.briefing.get_provider", return_value=mock_provider):
         with patch("src.briefing.send_telegram_message"):
             import src.briefing as briefing
             briefing.main()
 
     original_content = (tmp_path / "2026-04-17.md").read_text()
 
-    different_response = {**MOCK_CLAUDE_RESPONSE, "text": "different briefing text"}
+    different_response = {**MOCK_LLM_RESPONSE, "text": "different briefing text"}
+    mock_provider2 = make_mock_provider(different_response)
     sent = []
 
-    with patch("src.briefing.ask_claude", return_value=different_response):
+    with patch("src.briefing.get_provider", return_value=mock_provider2):
         with patch("src.briefing.send_telegram_message", side_effect=lambda t: sent.append(t)):
             result = briefing.main()
 
@@ -178,10 +208,28 @@ def test_same_day_double_run_does_not_overwrite(tmp_path, capsys):
 
 @freeze_time("2026-04-17 23:30:00")  # 23:30 UTC = 02:30+1day Cairo = 2026-04-18 02:30 Cairo
 def test_cairo_timezone_boundary(tmp_path):
-    with patch("src.briefing.ask_claude", return_value=MOCK_CLAUDE_RESPONSE):
+    mock_provider = make_mock_provider()
+
+    with patch("src.briefing.get_provider", return_value=mock_provider):
         with patch("src.briefing.send_telegram_message"):
             import src.briefing as briefing
             briefing.main()
 
     assert (tmp_path / "2026-04-18.md").exists()
     assert not (tmp_path / "2026-04-17.md").exists()
+
+
+@freeze_time("2026-04-17 06:00:00")
+def test_i7_2_provider_model_logged(tmp_path, caplog):
+    import logging
+    mock_provider = make_mock_provider()
+
+    with patch("src.briefing.get_provider", return_value=mock_provider):
+        with patch("src.briefing.send_telegram_message"):
+            import src.briefing as briefing
+            with caplog.at_level(logging.INFO, logger="src.briefing"):
+                briefing.main()
+
+    log_text = caplog.text
+    assert "gemini" in log_text or "anthropic" in log_text
+    assert "claude-opus-4-6" in log_text or "gemini" in log_text

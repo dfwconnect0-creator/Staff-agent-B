@@ -4,7 +4,7 @@ import sys
 from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 
-from src.claude_client import ask_claude
+from src.llm.factory import get_provider
 from src.telegram_client import send_telegram_message
 import src.memory.episodic as episodic
 from src.memory.schema import validate_prediction
@@ -108,7 +108,8 @@ def main() -> int:
 
     system_prompt, user_message = build_prompt(context, yesterday_memory, today)
 
-    result = ask_claude(system_prompt, user_message)
+    result = get_provider().complete(system_prompt, user_message)
+    log.info(f"LLM response from provider={result['provider']} model={result['model']}")
     briefing_text = result["text"]
     prediction = result["prediction"]
 
