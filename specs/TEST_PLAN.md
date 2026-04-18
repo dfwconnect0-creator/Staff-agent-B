@@ -1,255 +1,306 @@
-# TEST PLAN: Stage 1 — Episodic Memory
+# TEST PLAN: Stage 2 — Model-Agnostic LLM Layer
 
-Acceptance tests that define "done." Each test is written as Given/When/Then so it translates directly to pytest functions. Claude Code should implement these tests BEFORE writing the feature code (true SDD). Tests should fail initially, then pass once the feature is implemented.
+Acceptance tests that define "done." Each test is Given/When/Then so it maps directly to a pytest function. **Write tests first. They fail. Then implement. This is non-negotiable — it's the one thing Stage 1 got sloppy on.**
 
 Test file layout:
+
 ```
 tests/
-├── test_schema.py           # unit — JSON validation
-├── test_episodic.py         # unit — file read/write
-├── test_claude_client.py    # unit — response parsing
-├── test_ingest_replies.py   # unit — reply ingestion logic
-└── test_briefing_flow.py    # integration — full briefing flow with mocked LLM/Telegram
+├── test_llm_parsing.py                   # unit — shared JSON extraction
+├── test_llm_retry.py                     # unit — one-shot retry behavior
+├── test_llm_factory.py                   # unit — provider selection from env
+├── test_provider_anthropic.py            # unit — Anthropic, replaces test_claude_client.py
+├── test_provider_openai_compatible.py    # unit — shared base class behavior
+├── test_provider_gemini.py               # smoke — correct URL + headers
+├── test_provider_ollama.py               # smoke — correct URL + headers
+├── test_provider_openrouter.py           # smoke — correct URL + headers
+└── test_briefing_flow.py                 # integration — updated patches (existing file)
 ```
 
 ---
 
-## Unit tests — schema.py
+## Unit tests — parsing.py
 
-### T1.1 Valid prediction passes
-- **Given** a dict matching PREDICTION_SCHEMA exactly
-- **When** validate_prediction is called
-- **Then** returns (True, None)
+### P1.1 Single JSON block extracted
+- **Given** text `"some briefing\n\n```json\n{\"a\": 1}\n```"`
+- **When** `extract_last_json_block` is called
+- **Then** returns `({"a": 1}, "some briefing")`
 
-### T1.2 Missing required field fails
-- **Given** a prediction dict missing `stuck_item`
-- **When** validate_prediction is called
-- **Then** returns (False, error_message) and error mentions `stuck_item`
+### P1.2 Multiple JSON blocks — last wins
+- **Given** text with two fenced json blocks
+- **When** `extract_last_json_block` is called
+- **Then** returns the SECOND block's parsed content and the text before it (not between them)
 
-### T1.3 Wrong confidence value fails
-- **Given** prediction with `"confidence": "super_high"`
-- **When** validate_prediction is called
-- **Then** returns (False, error_message) and error mentions `confidence`
+### P1.3 No JSON block
+- **Given** text `"just briefing, no json"`
+- **When** `extract_last_json_block` is called
+- **Then** returns `(None, "just briefing, no json")`
 
-### T1.4 Extra unknown field fails
-- **Given** valid prediction plus extra `"llm_opinion": "great idea"` field
-- **When** validate_prediction is called
-- **Then** returns (False, error_message) — strict schema, no additional properties
+### P1.4 Malformed JSON in last block
+- **Given** text `"briefing\n\n```json\n{broken\n```"`
+- **When** `extract_last_json_block` is called
+- **Then** returns `(None, "briefing")` — text still trimmed to before the (malformed) block
 
-### T1.5 Too many flags fails
-- **Given** prediction with 15 items in flags_raised
-- **When** validate_prediction is called
-- **Then** returns (False, error_message)
-
-### T1.6 Empty questions_asked fails
-- **Given** prediction with `"questions_asked": []`
-- **When** validate_prediction is called
-- **Then** returns (False, error_message)
+### P1.5 JSON with multi-line string content
+- **Given** a valid JSON block containing newlines inside string values
+- **When** extracted
+- **Then** parses correctly — regex uses `re.DOTALL`
 
 ---
 
-## Unit tests — episodic.py
+## Unit tests — retry.py
 
-Use a pytest fixture `tmp_memory_dir` (based on `tmp_path`) that sets MEMORY_DIR to a temp location for each test.
+These use a mock `complete_fn` that can be configured to return different responses on successive calls.
 
-### T2.1 path_for generates correct filename
-- **Given** date 2026-04-17
-- **When** path_for is called
-- **Then** returns `<MEMORY_DIR>/2026-04-17.md`
+### R2.1 First call succeeds, no retry
+- **Given** `complete_fn` that returns a valid prediction on first call
+- **When** `with_json_retry` is called
+- **Then** `complete_fn` is called exactly once and its result is returned
 
-### T2.2 read_day returns None for missing file
-- **Given** empty memory directory
-- **When** read_day is called for any date
-- **Then** returns None (not raises)
+### R2.2 First call fails, retry succeeds
+- **Given** `complete_fn` that returns `prediction=None` first, valid prediction second
+- **When** `with_json_retry` is called
+- **Then** `complete_fn` is called twice, the second result is returned
 
-### T2.3 write_day creates file with correct structure
-- **Given** valid briefing_text and prediction dict
-- **When** write_day is called for 2026-04-17
-- **Then** file exists, contains `# 2026-04-17 (Friday)` header, contains `## Briefing sent` section with exact briefing_text, contains `## Prediction (agent-generated)` with JSON block parseable back to original prediction
+### R2.3 Retry call includes reminder as second message
+- **Given** `complete_fn` that returns `prediction=None` first
+- **When** `with_json_retry` is called
+- **Then** on the retry, the `messages` list passed to `complete_fn` contains the original user message, the assistant's first raw reply, and the `RETRY_REMINDER` as a new user turn (3 messages total)
 
-### T2.4 write_day on Sunday writes (Sunday) in header
-- **Given** date 2026-04-19 which is a Sunday
-- **When** write_day is called
-- **Then** header is `# 2026-04-19 (Sunday)`
+### R2.4 Both calls fail
+- **Given** `complete_fn` that returns `prediction=None` both times
+- **When** `with_json_retry` is called
+- **Then** `complete_fn` is called exactly twice, the second `None` result is returned (does not raise)
 
-### T2.5 write_day refuses to overwrite
-- **Given** a file already exists for 2026-04-17
-- **When** write_day is called for 2026-04-17 again
-- **Then** raises FileExistsError, original file unchanged
-
-### T2.6 read_day round-trips what write_day wrote
-- **Given** write_day called with (text="hello world", prediction={...valid...})
-- **When** read_day is called for same date
-- **Then** returned dict has briefing_text == "hello world" and prediction == the original dict
-
-### T2.7 read_day handles missing prediction JSON
-- **Given** a manually-written file with `## Briefing sent` but no JSON block
-- **When** read_day is called
-- **Then** returns dict with briefing_text populated and prediction == None
-
-### T2.8 read_day handles malformed JSON
-- **Given** a file with a `json` fenced block containing `{broken json`
-- **When** read_day is called
-- **Then** returns dict with prediction == None (does not raise)
-
-### T2.9 append_reply adds to existing file
-- **Given** an existing day file without `## User replies` section
-- **When** append_reply is called with timestamp "2026-04-17 09:12" and text "yo"
-- **Then** file now contains `## User replies` section with bullet `- **2026-04-17 09:12 Cairo:** "yo"`
-
-### T2.10 append_reply is idempotent
-- **Given** a day file already containing reply "yo" at timestamp "2026-04-17 09:12"
-- **When** append_reply is called with same timestamp and text
-- **Then** file unchanged (no duplicate bullet)
-
-### T2.11 append_reply preserves other sections
-- **Given** existing file with briefing, prediction, outcome
-- **When** append_reply is called
-- **Then** briefing, prediction, outcome sections all still present and unchanged
-
-### T2.12 append_reply raises on missing file
-- **Given** no file exists for 2026-04-17
-- **When** append_reply is called for 2026-04-17
-- **Then** raises FileNotFoundError
+### R2.5 First call raises exception
+- **Given** `complete_fn` that raises `httpx.HTTPError` on first call
+- **When** `with_json_retry` is called
+- **Then** the exception propagates — retry is only for bad JSON, not for HTTP errors
 
 ---
 
-## Unit tests — claude_client.py
+## Unit tests — factory.py
 
-Use `pytest-mock` to mock the Anthropic client.
+Use `monkeypatch.setenv` / `monkeypatch.delenv` in every test.
 
-### T3.1 Response with briefing text and JSON block parses correctly
-- **Given** mocked Claude response "🎯 briefing here\n\n```json\n{...valid...}\n```"
-- **When** ask_claude is called
-- **Then** returns `{"text": "🎯 briefing here", "prediction": {...parsed dict...}, "raw": "...full..."}`
+### F3.1 Anthropic provider selected by env
+- **Given** `LLM_PROVIDER=anthropic`, `ANTHROPIC_API_KEY=fake`
+- **When** `get_provider()` is called
+- **Then** returns `AnthropicProvider` instance with `model="claude-opus-4-6"`
 
-### T3.2 Response with no JSON block returns None prediction
-- **Given** mocked response "🎯 briefing text only, no json"
-- **When** ask_claude is called
-- **Then** returns `{"text": "🎯 briefing text only, no json", "prediction": None, "raw": "..."}`
+### F3.2 Gemini provider selected by env
+- **Given** `LLM_PROVIDER=gemini`, `GEMINI_API_KEY=fake`
+- **When** `get_provider()` is called
+- **Then** returns `GeminiProvider` with `model="gemini-2.5-flash-lite"`
 
-### T3.3 Response with malformed JSON returns None prediction
-- **Given** mocked response "🎯 briefing\n\n```json\n{bad json\n```"
-- **When** ask_claude is called
-- **Then** returns dict with prediction == None, briefing text preserved
+### F3.3 Ollama provider selected by env
+- **Given** `LLM_PROVIDER=ollama`, `OLLAMA_API_KEY=fake`
+- **When** `get_provider()` is called
+- **Then** returns `OllamaProvider` with `model="gpt-oss:120b-cloud"`
 
-### T3.4 Multiple JSON blocks: uses the last one
-- **Given** response with two ```json blocks
-- **When** ask_claude is called
-- **Then** the second (last) JSON is returned as prediction, text is everything before the last JSON block
+### F3.4 OpenRouter provider selected by env
+- **Given** `LLM_PROVIDER=openrouter`, `OPENROUTER_API_KEY=fake`
+- **When** `get_provider()` is called
+- **Then** returns `OpenRouterProvider` with `model="google/gemini-2.5-flash-lite"`
 
----
+### F3.5 LLM_MODEL overrides default
+- **Given** `LLM_PROVIDER=gemini`, `LLM_MODEL=gemini-2.5-pro`, `GEMINI_API_KEY=fake`
+- **When** `get_provider()` is called
+- **Then** returned provider has `model="gemini-2.5-pro"`
 
-## Unit tests — ingest_replies.py
+### F3.6 Missing LLM_PROVIDER raises ValueError
+- **Given** `LLM_PROVIDER` not set
+- **When** `get_provider()` is called
+- **Then** raises `ValueError` with a message listing the valid provider names
 
-### T4.1 Maps message timestamp to correct Cairo date
-- **Given** Telegram message with timestamp equivalent to "2026-04-17 23:30 UTC" (which is 2026-04-18 02:30 Cairo)
-- **When** parse_cairo_date is called
-- **Then** returns date(2026, 4, 18)
+### F3.7 Invalid LLM_PROVIDER raises ValueError
+- **Given** `LLM_PROVIDER=mistral`
+- **When** `get_provider()` is called
+- **Then** raises `ValueError` mentioning `mistral` and listing valid providers
 
-### T4.2 Filters out messages from other chat_ids
-- **Given** getUpdates returns 3 messages, 2 from TELEGRAM_CHAT_ID and 1 from other
-- **When** get_updates is called
-- **Then** returns only the 2 matching messages
+### F3.8 Missing API key for selected provider raises ValueError
+- **Given** `LLM_PROVIDER=gemini`, `GEMINI_API_KEY` not set
+- **When** `get_provider()` is called
+- **Then** raises `ValueError` mentioning `GEMINI_API_KEY`
 
-### T4.3 Appends reply to correct day's file
-- **Given** existing file `memory/episodic/2026-04-17.md` and a reply mapped to that day
-- **When** ingest_replies main runs
-- **Then** append_reply is called with correct date and message text
-
-### T4.4 Orphan replies go to .orphans.md
-- **Given** a reply mapped to 2026-04-17 but no file exists for that day
-- **When** ingest_replies main runs
-- **Then** `memory/episodic/.orphans.md` contains a line with the reply
-
-### T4.5 Updates last_update_id after successful ingestion
-- **Given** starts with last_update_id=100, ingests 3 messages with max update_id=250
-- **When** ingest_replies main completes
-- **Then** `.last_update_id` file contains "250"
-
-### T4.6 No updates → no file changes
-- **Given** getUpdates returns empty list
-- **When** ingest_replies main runs
-- **Then** no files are created or modified, .last_update_id unchanged
+### F3.9 Presence of unrelated API keys doesn't matter
+- **Given** `LLM_PROVIDER=gemini`, `GEMINI_API_KEY=fake`, `ANTHROPIC_API_KEY` not set
+- **When** `get_provider()` is called
+- **Then** succeeds — only the selected provider's key is checked
 
 ---
 
-## Integration tests — briefing_flow.py
+## Unit tests — provider_anthropic.py (replaces old test_claude_client.py)
 
-These test the full path with mocked external services but real file I/O.
+Mock `anthropic.Anthropic`. These are the Stage 1 T3.1–T3.4 tests, rewritten against `AnthropicProvider`.
 
-### T5.1 First-ever run creates file, no yesterday context
-- **Given** empty memory/episodic/, mocked Claude that returns valid briefing+JSON, mocked Telegram
-- **When** briefing.main runs with today=2026-04-17
-- **Then**:
-  - Telegram send was called once with the briefing text
-  - File `memory/episodic/2026-04-17.md` exists
-  - The Claude prompt did NOT contain "Yesterday's context" section
-  - File contains expected header, briefing, prediction JSON
+### A4.1 Response with briefing text and JSON block parses correctly
+- **Given** mocked Anthropic response containing briefing + valid JSON block
+- **When** `AnthropicProvider("claude-opus-4-6", "fake-key").complete(...)` is called
+- **Then** returned dict has: `text` = briefing portion, `prediction` = parsed dict, `raw` = full text, `provider="anthropic"`, `model="claude-opus-4-6"`
 
-### T5.2 Second day run includes yesterday verbatim
-- **Given** existing file for 2026-04-17 with prediction `{"stuck_item": "X", ...}`
-- **When** briefing.main runs with today=2026-04-18, captures prompt sent to Claude
-- **Then** the user_message sent to Claude contains the exact yesterday JSON including `"stuck_item": "X"` — verify with substring match on the full JSON, not paraphrase
+### A4.2 Response with no JSON block returns None prediction
+- **Given** mocked response with no JSON block
+- **When** `complete` is called
+- **Then** `prediction=None`, `text` equals raw, provider retries once then gives up
 
-### T5.3 Yesterday's replies are included in today's prompt
-- **Given** existing file for 2026-04-17 with prediction AND user_replies ["energy 3", "topic finder is fine"]
-- **When** briefing.main runs with today=2026-04-18
-- **Then** prompt to Claude contains both reply texts
+### A4.3 Response with malformed JSON returns None prediction after retry
+- **Given** mocked Anthropic client that returns malformed JSON on both calls
+- **When** `complete` is called
+- **Then** Anthropic SDK is called exactly twice (initial + retry), `prediction=None`
 
-### T5.4 Briefing sends even when JSON parsing fails
-- **Given** Claude returns briefing text but malformed JSON
-- **When** briefing.main runs
-- **Then**:
-  - Telegram send WAS called with briefing text
-  - No file was written for today
-  - Log contains "skipping memory write" message
-  - Exit code is 0 (not a failure)
+### A4.4 Multiple JSON blocks — last one wins
+- **Given** mocked response with two fenced json blocks, the second valid
+- **When** `complete` is called
+- **Then** `prediction` = second block's content, `text` is everything before the last block
 
-### T5.5 Briefing sends even when memory read fails
-- **Given** yesterday's file exists but is corrupt (invalid structure)
-- **When** briefing.main runs
-- **Then** briefing is sent successfully, prompt falls back to "no prior context", no crash
+### A4.5 Successful retry after initial bad JSON
+- **Given** mocked client that returns malformed JSON first, valid JSON second
+- **When** `complete` is called
+- **Then** Anthropic SDK is called twice, `prediction` is populated from second call
 
-### T5.6 Same-day double-run does not overwrite
-- **Given** briefing already ran successfully for today, file exists
-- **When** briefing.main runs again same day
-- **Then**:
-  - Telegram send IS called (user gets briefing either way)
-  - File is NOT overwritten
-  - Log contains "already exists" message
-  - Exit code is 0
+### A4.6 Model and provider fields populated
+- **Given** any valid response
+- **When** `complete` is called with `AnthropicProvider("some-model", "key")`
+- **Then** returned dict has `provider="anthropic"` and `model="some-model"`
 
-### T5.7 Cairo timezone boundary
-- **Given** system UTC time is 2026-04-17 23:30 UTC (which is 2026-04-18 02:30 Cairo)
-- **When** briefing.main runs
-- **Then** today's file is written as `2026-04-18.md`, not `2026-04-17.md`
+---
+
+## Unit tests — provider_openai_compatible.py
+
+These test the base class using a minimal concrete subclass defined in the test file:
+
+```python
+class _TestProvider(OpenAICompatibleProvider):
+    name = "test"
+    base_url = "https://example.com/v1/"
+    extra_headers = {}
+```
+
+Mock `httpx.post` throughout.
+
+### O5.1 Request shape matches OpenAI chat-completions format
+- **Given** mocked `httpx.post` that records the request payload
+- **When** `_TestProvider("m", "k").complete("sys prompt", "user msg")` is called with a response containing valid JSON
+- **Then** the POST body has `model="m"`, `messages=[{"role":"system","content":"sys prompt"},{"role":"user","content":"user msg"}]`, `max_tokens=1024`
+
+### O5.2 Authorization header uses Bearer token
+- **Given** mocked `httpx.post`
+- **When** `complete` is called with `api_key="my-key"`
+- **Then** the request headers include `Authorization: Bearer my-key` and `Content-Type: application/json`
+
+### O5.3 extra_headers are included
+- **Given** a subclass with `extra_headers = {"X-Custom": "abc"}`
+- **When** `complete` is called
+- **Then** request headers include `X-Custom: abc` and also the standard Authorization/Content-Type
+
+### O5.4 URL is `{base_url}/chat/completions` with no double slash
+- **Given** `base_url = "https://example.com/v1/"` (trailing slash)
+- **When** `complete` is called
+- **Then** `httpx.post` is called with URL `https://example.com/v1/chat/completions` (single slash)
+
+### O5.5 Response parsing — content extracted from choices[0].message.content
+- **Given** mocked HTTP 200 response with body `{"choices":[{"message":{"content":"🎯 briefing\n\n```json\n{\"schema_version\":1,...}\n```"}}]}`
+- **When** `complete` is called
+- **Then** returned `raw` equals the content string, `prediction` is parsed, `text` is the briefing portion
+
+### O5.6 HTTP error propagates
+- **Given** mocked `httpx.post` that raises `httpx.HTTPStatusError`
+- **When** `complete` is called
+- **Then** the exception is raised — no swallowing (this test guards R2.5's semantics at the provider layer)
+
+### O5.7 Retry on bad JSON triggers second POST
+- **Given** mocked `httpx.post` that returns content with malformed JSON first, valid JSON second
+- **When** `complete` is called
+- **Then** `httpx.post` is called exactly twice, final result has valid `prediction`
+
+---
+
+## Smoke tests — provider_gemini.py, provider_ollama.py, provider_openrouter.py
+
+Each file has 2 tests. These verify only the URL and headers — the behavior is already covered by `test_provider_openai_compatible.py`.
+
+### G6.1 / OL6.1 / OR6.1 — Correct base_url
+- **When** provider is instantiated and `complete` is called
+- **Then** `httpx.post` is invoked with:
+  - Gemini: `https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`
+  - Ollama: `https://ollama.com/v1/chat/completions`
+  - OpenRouter: `https://openrouter.ai/api/v1/chat/completions`
+
+### G6.2 / OL6.2 / OR6.2 — Correct headers
+- **When** `complete` is called with api_key="k"
+- **Then** request headers include `Authorization: Bearer k`, and for OpenRouter specifically also `HTTP-Referer` and `X-Title`
+
+---
+
+## Integration tests — briefing_flow.py (MODIFIED from Stage 1)
+
+All seven Stage 1 integration tests remain. The only change is how the LLM is mocked — `src.briefing.ask_claude` no longer exists, so patches target `src.briefing.get_provider`.
+
+### I7.1 All Stage 1 briefing tests still pass after refactor
+- **Given** Stage 1 T5.1–T5.7 tests, with `patch("src.briefing.ask_claude", ...)` replaced by `patch("src.briefing.get_provider", return_value=<mock provider>)` where mock provider's `.complete()` returns the same dict shape Stage 1 used
+- **When** the test suite runs
+- **Then** all 7 tests pass with no other changes
+
+### I7.2 Provider/model fields are logged (new)
+- **Given** a mock provider that returns `{"text": "...", "prediction": {...}, "raw": "...", "provider": "gemini", "model": "gemini-2.5-flash-lite"}`
+- **When** `briefing.main()` runs
+- **Then** the captured log output contains a line mentioning `"gemini"` and `"gemini-2.5-flash-lite"` (log level INFO or above)
 
 ---
 
 ## Manual/smoke tests (run once after implementation)
 
-Not pytest — these you run yourself end-to-end.
+### M1. Anthropic still works
+```
+LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=... \
+TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... \
+uv run python -m src.briefing
+```
+Expected: Telegram message arrives. `memory/episodic/YYYY-MM-DD.md` created. Behavior identical to Stage 1.
 
-### M1. Real first run
-Delete any test files. Run `uv run python src/briefing.py` with real env vars. Verify: Telegram message arrives, `memory/episodic/YYYY-MM-DD.md` appears with real content, JSON block is valid.
+### M2. Gemini works on free tier
+```
+LLM_PROVIDER=gemini GEMINI_API_KEY=... \
+TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... \
+uv run python -m src.briefing
+```
+Expected: Telegram message arrives. `memory/episodic/...md` file exists. Log line confirms `provider=gemini, model=gemini-2.5-flash-lite`. Delete this test file before the real daily cron runs.
 
-### M2. Real second-day run
-Edit the file's date to yesterday. Run briefing again. Verify: the prompt (log it) contained yesterday's JSON verbatim, today's file is created, second message arrives.
+### M3. Ollama Cloud works
+```
+LLM_PROVIDER=ollama OLLAMA_API_KEY=... \
+TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... \
+uv run python -m src.briefing
+```
+Expected: same as above. Delete the test file.
 
-### M3. Reply ingestion
-Send a Telegram reply manually. Run `uv run python src/ingest_replies.py`. Verify: reply appears in today's file under `## User replies`. Run again — verify idempotency, no duplicate.
+### M4. OpenRouter works
+```
+LLM_PROVIDER=openrouter OPENROUTER_API_KEY=... \
+TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... \
+uv run python -m src.briefing
+```
+Expected: same as above. Delete the test file.
 
-### M4. GitHub Actions commit-back
-Push code, trigger workflow manually. Verify: after run completes, a commit appears in the repo containing the new memory file, committed by `chief-of-staff-bot`.
+### M5. Missing provider config fails fast
+```
+uv run python -m src.briefing
+```
+(No env vars set.) Expected: `ValueError: LLM_PROVIDER not set. Valid options: anthropic, gemini, ollama, openrouter`. Telegram is NOT called. No memory file written.
+
+### M6. Invalid JSON from a real provider recovers via retry
+Hardest to test manually. Best approach: run M2 with `LLM_MODEL=gemini-2.5-flash-lite` for several days. If you ever see a "skipping memory write" log line followed by a successful Telegram send, the graceful-degradation + retry path worked. Passive observation; not a blocking test.
 
 ---
 
 ## What "done" means
 
-- [ ] All T1–T5 tests are written and passing
-- [ ] M1–M4 manual tests executed successfully
-- [ ] No code paths where a Claude-generated string is written to disk without validation
-- [ ] `memory/episodic/.gitkeep` committed, directory survives fresh clone
-- [ ] README updated to document the new flow
-- [ ] Non-goals NOT implemented (no llm/ directory, no semantic memory, no LanceDB)
+- [ ] All P, R, F, A, O, G, OL, OR, I tests are written and passing
+- [ ] Stage 1 tests in `test_schema.py`, `test_episodic.py`, `test_ingest_replies.py` still pass unchanged
+- [ ] `tests/test_claude_client.py` is deleted (its cases live on as A4.*)
+- [ ] M1–M5 manual tests executed successfully
+- [ ] `src/claude_client.py` is deleted
+- [ ] Flipping `LLM_PROVIDER` env var in GitHub Actions variables switches the briefing provider with no code change on the next scheduled run
+- [ ] README updated with the "choosing a provider" section
+- [ ] Non-goals NOT implemented (no fallback chains, no YAML config, no native structured outputs)

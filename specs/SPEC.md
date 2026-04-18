@@ -1,28 +1,35 @@
-# SPEC: Stage 1 — Episodic Memory
+# SPEC: Stage 2 — Model-Agnostic LLM Layer
 
 **Status:** Ready to implement
-**Target repo:** `chief-of-staff` (existing v1, stateless briefing agent)
-**Scope:** Add episodic memory — daily markdown files that give the agent day-over-day continuity. Also wire a feedback loop via Telegram replies.
-**Out of scope:** LLM switching, semantic memory, vector search, graph memory. These come in later stages — do NOT add them.
+**Target repo:** `chief-of-staff` (post-Stage 1, has episodic memory)
+**Scope:** Introduce a provider abstraction so the agent can run against Anthropic, Gemini, Ollama Cloud, or OpenRouter without code changes to `briefing.py` or `ingest_replies.py`. Keep Anthropic working exactly as it does today.
+**Out of scope:** Fallback chains, A/B routing per task, cost tracking, model benchmarking, local Ollama. These come later.
 
 ---
 
 ## 1. Problem statement
 
-v1 is stateless. Every morning, Claude sees `soul.md`, `user.md`, `heartbeat.md` and predicts what's stuck with no knowledge of yesterday. This stage gives the agent memory of its own predictions and a way to learn whether those predictions were right, by reading the user's reply to yesterday's Telegram message.
+v2 is Anthropic-only. `src/claude_client.py` imports the `anthropic` SDK directly and is imported by name in `briefing.py`. This blocks three things you want:
 
-The source of truth is plain markdown files in `memory/episodic/`. The LLM never writes to these files directly — it proposes structured JSON, Python validates and writes. This pattern is load-bearing for every future stage.
+1. **Cost** — use cheap Gemini 2.5 Flash-Lite ($0.10/$0.40 per 1M tokens, free tier available) for dev iterations instead of burning Anthropic credits on every test run.
+2. **Resilience** — if one provider has an outage or a bad day, switch providers by flipping an env var instead of waiting it out.
+3. **Experimentation** — compare what different models produce for the same briefing prompt without forking the codebase.
+
+The insight that makes this easy: **three of the four providers speak the same protocol**. Ollama Cloud, Gemini (via its OpenAI-compat endpoint), and OpenRouter all expose OpenAI-compatible `/v1/chat/completions`. Anthropic is the odd one out with its `/v1/messages` API.
+
+So we need two protocol adapters, not four, and a thin interface that both satisfy.
 
 ---
 
 ## 2. Architectural rules (non-negotiable)
 
-1. **LLM never writes to disk.** Claude returns text + structured JSON. Python code validates the JSON against a schema and writes the markdown file. If validation fails, the briefing still sends but the memory write is skipped and logged.
-2. **Markdown is the source of truth.** Not JSON, not SQLite. Plain files in `memory/episodic/`. Filename is `YYYY-MM-DD.md` in Cairo time.
-3. **Append-only.** Today's file is written once per run. Never modify past days' files programmatically. If a past file needs correction, user edits by hand.
-4. **Yesterday's context passes through verbatim.** When today's run reads yesterday's file, it embeds yesterday's prediction JSON in today's prompt unchanged. No summarization, no rewording. Summarization is where drift hides.
-5. **Telegram reply ingestion is a separate concern from the briefing run.** The briefing cron runs once per morning. Reply ingestion runs independently (also on a cron) and writes into the relevant day's file. Never combine these into one workflow.
-6. **If memory read fails, briefing still runs.** A missing or malformed yesterday file degrades gracefully to "no prior context available." Never let memory errors block the briefing.
+1. **One `Provider` interface, one method.** Every provider implements `complete(system_prompt, user_message) -> {text, prediction, raw, provider, model}`. That's it. No streaming, no tool use, no images in Stage 2.
+2. **JSON extraction lives in one place.** The `_extract_last_json_block` regex logic currently in `claude_client.py` moves into a shared helper in `src/llm/parsing.py`. All providers use it. Duplicating this across providers is how drift starts.
+3. **Provider selection happens at one point.** A `get_provider()` factory function reads env vars and returns a configured provider instance. `briefing.py` calls this once; it never knows which provider it got.
+4. **Env vars are the only configuration surface for Stage 2.** No YAML, no TOML sections, no runtime switches. Reason: Stage 1 patterns. Stage 1 used env vars (`ANTHROPIC_API_KEY`, `TELEGRAM_BOT_TOKEN`) and nothing else, the cron runs them through GitHub Actions secrets, and it works. Adding a config file now means a new parsing module, a new precedence rule, and a new failure mode — pay that cost later if per-task routing becomes real.
+5. **Anthropic stays working byte-for-byte.** The existing Stage 1 tests for `claude_client.py` must pass unchanged after the refactor. Behavior of the Anthropic path is regression-locked.
+6. **The JSON-prediction contract is unchanged from Stage 1.** Same schema (`PREDICTION_SCHEMA`), same validation, same "LLM never writes to disk" rule, same `briefing.py` flow. We're replacing the inside of `ask_claude`, not the contract around it.
+7. **Lowest-friction JSON handling:** prompt every provider the same way Anthropic is prompted — "output a fenced ```json block last." Parse the last block with the shared regex. If parsing fails, retry once with a terse reminder ("The JSON block was missing or malformed. Return only a fenced ```json block containing the required fields.") and append it to the prior messages. If the retry fails, return `prediction=None` and let Stage 1's existing skip-memory-write path handle it. No provider-specific structured-output features in Stage 2 — they diverge (Gemini wants `responseSchema`, OpenAI wants `json_schema`, Ollama does its own thing) and the prompt-based approach works on all three with one code path.
 
 ---
 
@@ -30,401 +37,400 @@ The source of truth is plain markdown files in `memory/episodic/`. The LLM never
 
 ```
 chief-of-staff/
-├── .github/workflows/
-│   ├── daily-briefing.yml          [MODIFIED — now passes memory path]
-│   └── ingest-replies.yml          [NEW — reads Telegram replies, updates files]
-├── context/                         [UNCHANGED]
-│   ├── soul.md
-│   ├── user.md
-│   └── heartbeat.md
-├── memory/                          [NEW]
-│   └── episodic/
-│       └── .gitkeep                 [NEW — keep dir in git even when empty]
 ├── src/
-│   ├── briefing.py                  [MODIFIED — reads memory, writes memory]
-│   ├── claude_client.py             [MODIFIED — ask_claude returns (text, json)]
-│   ├── telegram_client.py           [MODIFIED — add get_updates() for replies]
-│   ├── memory/                      [NEW package]
+│   ├── briefing.py                      [MODIFIED — one import change, one call change]
+│   ├── ingest_replies.py                [UNCHANGED]
+│   ├── telegram_client.py               [UNCHANGED]
+│   ├── claude_client.py                 [DELETED — logic moves into llm/providers/anthropic.py]
+│   ├── llm/                             [NEW package]
 │   │   ├── __init__.py
-│   │   ├── episodic.py              [NEW — read/write daily files]
-│   │   └── schema.py                [NEW — JSON validation]
-│   └── ingest_replies.py            [NEW — reads Telegram replies]
-├── tests/                           [NEW]
-│   ├── __init__.py
-│   ├── test_episodic.py
-│   ├── test_schema.py
-│   └── fixtures/
-│       └── sample_day.md
-├── pyproject.toml                   [MODIFIED — add jsonschema, pytest]
-└── README.md                        [MODIFIED — document new flow]
+│   │   ├── base.py                      [NEW — Provider ABC + LLMResponse typed dict]
+│   │   ├── factory.py                   [NEW — get_provider() reads env, returns configured instance]
+│   │   ├── parsing.py                   [NEW — extract_last_json_block, shared across providers]
+│   │   ├── retry.py                     [NEW — one-shot retry with reminder on bad JSON]
+│   │   └── providers/
+│   │       ├── __init__.py
+│   │       ├── anthropic.py             [NEW — wraps Anthropic SDK, same behavior as old claude_client]
+│   │       ├── openai_compatible.py     [NEW — base class for OpenAI-format providers]
+│   │       ├── gemini.py                [NEW — thin subclass, points at Gemini's OpenAI-compat endpoint]
+│   │       ├── ollama.py                [NEW — thin subclass, points at Ollama Cloud]
+│   │       └── openrouter.py            [NEW — thin subclass, points at OpenRouter]
+│   └── memory/                          [UNCHANGED]
+├── tests/
+│   ├── test_llm_parsing.py              [NEW — the JSON extraction tests migrate here]
+│   ├── test_llm_factory.py              [NEW]
+│   ├── test_llm_retry.py                [NEW]
+│   ├── test_provider_anthropic.py       [NEW — replaces test_claude_client.py]
+│   ├── test_provider_openai_compatible.py  [NEW]
+│   ├── test_provider_gemini.py          [NEW — smoke: correct base_url + headers]
+│   ├── test_provider_ollama.py          [NEW — smoke: correct base_url + headers]
+│   └── test_provider_openrouter.py      [NEW — smoke: correct base_url + headers]
+├── pyproject.toml                       [MODIFIED — remove anthropic-only deps, add openai]
+└── README.md                            [MODIFIED — document provider selection]
 ```
+
+The `tests/test_claude_client.py` file from Stage 1 is **deleted** as part of this refactor — its tests are reimplemented against the new structure in `test_provider_anthropic.py`.
 
 ---
 
-## 4. Data contract — the daily file format
+## 4. Data contract — the `LLMResponse` shape
 
-Every file `memory/episodic/YYYY-MM-DD.md` has this exact structure. No deviations. This is what the agent reads and writes.
-
-```markdown
-# 2026-04-17 (Friday)
-
-## Briefing sent
-
-[Raw briefing text that was sent to Telegram, verbatim.]
-
-## Prediction (agent-generated)
-
-```json
-{
-  "schema_version": 1,
-  "stuck_item": "Topic finder GitHub Actions step — workflow not completing",
-  "smallest_action": "Open last workflow run in GitHub, read the error",
-  "confidence": "medium",
-  "flags_raised": ["last_10_percent", "external_dependency"],
-  "questions_asked": [
-    "Did you check the workflow run today?",
-    "Is the junior developer still on NotebookLM infographics?",
-    "Energy level 1-5?"
-  ]
-}
-```
-
-## User replies (ingested from Telegram)
-
-- **2026-04-17 09:12 Cairo:** "yeah topic finder is actually fine, the real stuck one is course conversion — 3 leads ghosted"
-- **2026-04-17 09:15 Cairo:** "energy 3"
-
-## Outcome (optional, user-editable)
-
-_Prediction was partially wrong. Correct stuck item: course conversion follow-up, not topic finder._
-```
-
-**Required sections:** `# header`, `## Briefing sent`, `## Prediction (agent-generated)`.
-**Optional sections:** `## User replies`, `## Outcome`. Omitted if no data.
-
-The JSON block uses fenced code with `json` language tag. This is what the parser looks for.
-
----
-
-## 5. JSON schema for predictions
-
-File: `src/memory/schema.py`. Use `jsonschema` library.
+Every provider's `complete()` method returns the same dict:
 
 ```python
-PREDICTION_SCHEMA = {
-    "type": "object",
-    "required": ["schema_version", "stuck_item", "smallest_action", "confidence", "flags_raised", "questions_asked"],
-    "additionalProperties": False,
-    "properties": {
-        "schema_version": {"type": "integer", "const": 1},
-        "stuck_item": {"type": "string", "minLength": 5, "maxLength": 300},
-        "smallest_action": {"type": "string", "minLength": 5, "maxLength": 300},
-        "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
-        "flags_raised": {
-            "type": "array",
-            "items": {"type": "string"},
-            "maxItems": 10,
-        },
-        "questions_asked": {
-            "type": "array",
-            "items": {"type": "string"},
-            "minItems": 1,
-            "maxItems": 5,
-        },
-    },
+{
+    "text": str,                # briefing text for Telegram (everything before the last ```json block)
+    "prediction": dict | None,  # parsed JSON from the last ```json block, None if missing/malformed
+    "raw": str,                 # full model output, for debugging
+    "provider": str,            # "anthropic" | "gemini" | "ollama" | "openrouter"
+    "model": str,               # the model string actually sent ("claude-opus-4-6", "gemini-2.5-flash-lite", etc.)
 }
 ```
 
-Validation rule: if JSON fails validation, log the failure, send the briefing anyway, skip the memory write. Do NOT crash.
+This is a superset of what `ask_claude` returned in Stage 1 — the addition is `provider` and `model` so that `briefing.py` can log which provider answered, and so future stages can record it in `memory/episodic/` if we want to.
+
+Stage 1's `briefing.py` consumed `result["text"]` and `result["prediction"]`. That stays the same. The two new fields are additive.
+
+---
+
+## 5. Environment variables
+
+One required variable and a set of provider-specific ones. Only the vars for the chosen provider need to be set.
+
+```
+# Required
+LLM_PROVIDER=anthropic      # anthropic | gemini | ollama | openrouter
+
+# Optional — overrides the default model for whichever provider is selected
+LLM_MODEL=                   # e.g. "claude-opus-4-6", "gemini-2.5-flash-lite", "gpt-oss:120b-cloud"
+
+# Provider-specific keys (set only the one you need)
+ANTHROPIC_API_KEY=...
+GEMINI_API_KEY=...
+OLLAMA_API_KEY=...
+OPENROUTER_API_KEY=...
+```
+
+**Default models per provider** (used when `LLM_MODEL` is not set):
+
+| Provider    | Default model              | Base URL                                    |
+|-------------|----------------------------|---------------------------------------------|
+| anthropic   | `claude-opus-4-6`          | (SDK-managed)                               |
+| gemini      | `gemini-2.5-flash-lite`    | `https://generativelanguage.googleapis.com/v1beta/openai/` |
+| ollama      | `gpt-oss:120b-cloud`       | `https://ollama.com/v1/`                    |
+| openrouter  | `google/gemini-2.5-flash-lite` | `https://openrouter.ai/api/v1/`         |
+
+If `LLM_PROVIDER` is unset, the factory raises `ValueError` with a clear message listing the valid options. No silent default — we want the deployment to be explicit.
+
+If the API key for the chosen provider is missing, the factory raises `ValueError` before any HTTP call is made.
 
 ---
 
 ## 6. Module specifications
 
-### 6.1 `src/memory/episodic.py`
+### 6.1 `src/llm/base.py`
 
 ```python
-from pathlib import Path
-from datetime import date
+from abc import ABC, abstractmethod
+from typing import TypedDict
 
-MEMORY_DIR: Path  # Resolved from repo root / memory / episodic
+class LLMResponse(TypedDict):
+    text: str
+    prediction: dict | None
+    raw: str
+    provider: str
+    model: str
 
-def path_for(day: date) -> Path:
-    """Return memory/episodic/YYYY-MM-DD.md for given date."""
+class Provider(ABC):
+    name: str  # class attribute, e.g. "anthropic"
 
-def read_day(day: date) -> dict | None:
-    """
-    Read a day's file and return:
-    {
-        "date": "2026-04-17",
-        "briefing_text": str,
-        "prediction": dict | None,     # parsed JSON block, None if missing/invalid
-        "user_replies": list[dict],    # [{"timestamp": str, "text": str}, ...]
-        "outcome": str | None,
-    }
-    Returns None if file does not exist.
-    Never raises on malformed content — returns best-effort dict with None fields.
-    """
+    def __init__(self, model: str, api_key: str):
+        self.model = model
+        self.api_key = api_key
 
-def write_day(day: date, briefing_text: str, prediction: dict) -> Path:
-    """
-    Create a new day file. Raises FileExistsError if file already exists
-    (same-day double-run is a bug we want to know about, not silently overwrite).
-    Returns path to written file.
-    """
-
-def append_reply(day: date, timestamp_cairo: str, text: str) -> None:
-    """
-    Append a user reply to an existing day file under '## User replies'.
-    If '## User replies' section doesn't exist, create it.
-    Idempotent: if (timestamp, text) already present, do nothing.
-    Raises FileNotFoundError if the day file doesn't exist yet.
-    """
+    @abstractmethod
+    def complete(self, system_prompt: str, user_message: str) -> LLMResponse:
+        ...
 ```
 
-### 6.2 `src/memory/schema.py`
+### 6.2 `src/llm/parsing.py`
 
-Exports `PREDICTION_SCHEMA` and `validate_prediction(data: dict) -> tuple[bool, str | None]`. Returns `(True, None)` on valid, `(False, error_message)` on invalid.
-
-### 6.3 `src/claude_client.py` (modified)
-
-Change `ask_claude` signature to return a structured result:
+Exports exactly one function:
 
 ```python
-def ask_claude(system_prompt: str, user_message: str) -> dict:
+def extract_last_json_block(text: str) -> tuple[dict | None, str]:
     """
-    Returns:
-    {
-        "text": str,           # the briefing for Telegram
-        "prediction": dict | None,  # parsed JSON, None if parsing failed
-        "raw": str,            # full model output, for debugging
-    }
+    Find the LAST ```json ... ``` fenced block in text.
+    Returns (parsed_dict_or_None, text_before_last_block).
+    Regex: r"```json\s*\n(.*?)\n```" with re.DOTALL, take last match.
+    If no block found: returns (None, text).
+    If block found but invalid JSON: returns (None, text_before_last_block).
     """
 ```
 
-How to split: the prompt (see section 7) instructs Claude to produce the briefing text, then a fenced `json` block at the end. The client extracts the last `json` fenced block as the prediction. Everything before it is the briefing text.
+This is the same logic that currently lives in `claude_client._extract_last_json_block`. It's moved here so the three OpenAI-compatible providers can share it with the Anthropic provider.
 
-If no JSON block found, `prediction = None` and `text = raw`.
-
-### 6.4 `src/briefing.py` (modified)
-
-New flow:
+### 6.3 `src/llm/retry.py`
 
 ```python
-def main():
-    context = load_context()
-    today = datetime.now(CAIRO_TZ).date()
-    yesterday = today - timedelta(days=1)
+RETRY_REMINDER = (
+    "The JSON block was missing or malformed. "
+    "Return only a single fenced ```json block at the end of your reply, "
+    "containing exactly these fields: schema_version, stuck_item, smallest_action, "
+    "confidence, flags_raised, questions_asked."
+)
 
-    yesterday_memory = episodic.read_day(yesterday)  # may be None
-
-    system_prompt, user_message = build_prompt(context, yesterday_memory, today)
-
-    result = ask_claude(system_prompt, user_message)
-    briefing_text = result["text"]
-    prediction = result["prediction"]
-
-    if not briefing_text.strip():
-        send_telegram_message("⚠️ Empty briefing. Check logs.")
-        sys.exit(1)
-
-    send_telegram_message(briefing_text)
-
-    # Memory write — only if prediction is valid
-    if prediction is None:
-        log("No valid prediction JSON in response, skipping memory write")
-        return 0
-
-    valid, err = validate_prediction(prediction)
-    if not valid:
-        log(f"Prediction failed schema: {err}, skipping memory write")
-        return 0
-
-    try:
-        episodic.write_day(today, briefing_text, prediction)
-    except FileExistsError:
-        log(f"File for {today} already exists, not overwriting")
-    return 0
-```
-
-### 6.5 `src/telegram_client.py` (modified — add one function)
-
-```python
-def get_updates(since_update_id: int = 0) -> list[dict]:
+def with_json_retry(complete_fn, system_prompt, user_message) -> LLMResponse:
     """
-    Call Telegram getUpdates API. Return list of message dicts:
-    [{"update_id": int, "timestamp_cairo": str, "text": str, "chat_id": int}, ...]
-    Filters to only messages from TELEGRAM_CHAT_ID.
+    Call complete_fn once. If prediction is None, call it a second time
+    with an appended reminder message. Return whichever response is better —
+    the retry if it succeeded, otherwise the original.
     """
 ```
 
-### 6.6 `src/ingest_replies.py` (new, standalone entry point)
-
-Runs on its own cron (every 2 hours, say). Reads Telegram replies since last ingestion, maps each to a day (based on Cairo date of message timestamp), appends to that day's file.
-
-Last-ingested update_id is tracked in `memory/episodic/.last_update_id`. This is the only state file outside per-day files. It's gitignored (written by Actions, not committed).
+`complete_fn` is the provider's low-level single-shot call (not the public `complete` method, which delegates through `with_json_retry`). Providers are written as:
 
 ```python
-def main():
-    last_id = read_last_update_id()  # from memory/episodic/.last_update_id, default 0
-    updates = telegram.get_updates(since_update_id=last_id)
-    for update in updates:
-        day = parse_cairo_date(update["timestamp_cairo"])
-        try:
-            episodic.append_reply(day, update["timestamp_cairo"], update["text"])
-        except FileNotFoundError:
-            # Reply to a day we never briefed on — save to orphans
-            append_to_orphans(update)
-    if updates:
-        write_last_update_id(max(u["update_id"] for u in updates))
+def complete(self, system_prompt, user_message):
+    return with_json_retry(self._single_shot, system_prompt, user_message)
 ```
 
-Orphan replies go to `memory/episodic/.orphans.md` — a catch-all for messages that don't map to a briefed day. Keeps the signal, doesn't lose it.
+One retry maximum. No exponential backoff, no infinite loops. If both attempts fail, `prediction` is `None` and Stage 1's graceful-degradation path (skip memory write, still send briefing) takes over.
 
----
+### 6.4 `src/llm/factory.py`
 
-## 7. Prompt changes
-
-The system prompt stays `soul.md`. The user message changes:
-
-```
-Today is {day_name}, {date_str} (Cairo time).
-
-{IF yesterday_memory exists and has prediction:}
-## Yesterday's context
-
-Yesterday ({yesterday_date}) you predicted:
-
-```json
-{yesterday_prediction_json_verbatim}
-```
-
-{IF user_replies present:}
-The user replied:
-{formatted_user_replies}
-{END IF}
-
-Use this to calibrate today's briefing. If yesterday's prediction was wrong based on the replies, adjust. If it was right but still unresolved, flag it again more firmly.
-
-{END IF}
-
---- USER PROFILE (user.md) ---
-{user.md contents}
-
---- DAILY CHECKLIST (heartbeat.md) ---
-{heartbeat.md contents}
-
---- YOUR TASK ---
-
-[same briefing structure as v1: 🎯 stuck item, ✂️ smallest action, ❓ three questions, ⚡ energy check]
-
-AFTER the briefing text, output a JSON block with this exact structure:
-
-```json
-{
-  "schema_version": 1,
-  "stuck_item": "one-line name of the stuck item",
-  "smallest_action": "the single smallest action to unblock it",
-  "confidence": "low|medium|high",
-  "flags_raised": ["flag1", "flag2"],
-  "questions_asked": ["question 1", "question 2", "question 3"]
+```python
+DEFAULT_MODELS = {
+    "anthropic": "claude-opus-4-6",
+    "gemini": "gemini-2.5-flash-lite",
+    "ollama": "gpt-oss:120b-cloud",
+    "openrouter": "google/gemini-2.5-flash-lite",
 }
+
+API_KEY_ENVS = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "ollama": "OLLAMA_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+}
+
+def get_provider() -> Provider:
+    """
+    Read LLM_PROVIDER and LLM_MODEL from env.
+    Validate provider name is in DEFAULT_MODELS.
+    Validate the provider's API key env var is set.
+    Construct and return the matching provider instance.
+    Raises ValueError on any missing/invalid config.
+    """
 ```
 
-The JSON must come last. The briefing text (above the JSON) is what I'll read on my phone.
+### 6.5 `src/llm/providers/anthropic.py`
+
+Wraps the `anthropic` SDK. Same model default (`claude-opus-4-6`), same API call shape, same max_tokens (1024), same JSON extraction — but now using the shared `extract_last_json_block` instead of a local copy.
+
+```python
+from anthropic import Anthropic
+from src.llm.base import Provider, LLMResponse
+from src.llm.parsing import extract_last_json_block
+from src.llm.retry import with_json_retry
+
+class AnthropicProvider(Provider):
+    name = "anthropic"
+
+    def __init__(self, model: str, api_key: str):
+        super().__init__(model, api_key)
+        self._client = Anthropic(api_key=api_key)
+
+    def complete(self, system_prompt: str, user_message: str) -> LLMResponse:
+        return with_json_retry(self._single_shot, system_prompt, user_message)
+
+    def _single_shot(self, system_prompt: str, messages: list[dict]) -> LLMResponse:
+        msg = self._client.messages.create(
+            model=self.model,
+            max_tokens=1024,
+            system=system_prompt,
+            messages=messages,
+        )
+        raw = msg.content[0].text
+        prediction, text_before = extract_last_json_block(raw)
+        return {
+            "text": text_before if prediction is not None else raw,
+            "prediction": prediction,
+            "raw": raw,
+            "provider": self.name,
+            "model": self.model,
+        }
 ```
+
+Note the `messages: list[dict]` shape — that's so the retry can append the reminder as a second turn. The retry helper is the only thing that knows about multi-turn; the provider just accepts a list.
+
+### 6.6 `src/llm/providers/openai_compatible.py`
+
+A base class for Gemini, Ollama, and OpenRouter. All three accept the same request shape at different URLs with different keys.
+
+```python
+import httpx
+from src.llm.base import Provider, LLMResponse
+from src.llm.parsing import extract_last_json_block
+from src.llm.retry import with_json_retry
+
+class OpenAICompatibleProvider(Provider):
+    base_url: str  # subclasses override
+    extra_headers: dict  # subclasses can override
+
+    def complete(self, system_prompt, user_message):
+        return with_json_retry(self._single_shot, system_prompt, user_message)
+
+    def _single_shot(self, system_prompt, messages):
+        payload = {
+            "model": self.model,
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                *messages,  # list of {"role": "user"|"assistant", "content": "..."}
+            ],
+        }
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            **self.extra_headers,
+        }
+        url = f"{self.base_url.rstrip('/')}/chat/completions"
+        resp = httpx.post(url, json=payload, headers=headers, timeout=60.0)
+        resp.raise_for_status()
+        raw = resp.json()["choices"][0]["message"]["content"]
+        prediction, text_before = extract_last_json_block(raw)
+        return {
+            "text": text_before if prediction is not None else raw,
+            "prediction": prediction,
+            "raw": raw,
+            "provider": self.name,
+            "model": self.model,
+        }
+```
+
+### 6.7 `src/llm/providers/gemini.py`, `ollama.py`, `openrouter.py`
+
+Each is ~10 lines:
+
+```python
+# gemini.py
+from src.llm.providers.openai_compatible import OpenAICompatibleProvider
+
+class GeminiProvider(OpenAICompatibleProvider):
+    name = "gemini"
+    base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    extra_headers = {}
+```
+
+```python
+# ollama.py
+class OllamaProvider(OpenAICompatibleProvider):
+    name = "ollama"
+    base_url = "https://ollama.com/v1/"
+    extra_headers = {}
+```
+
+```python
+# openrouter.py
+class OpenRouterProvider(OpenAICompatibleProvider):
+    name = "openrouter"
+    base_url = "https://openrouter.ai/api/v1/"
+    extra_headers = {
+        "HTTP-Referer": "https://github.com/<user>/chief-of-staff",
+        "X-Title": "chief-of-staff",
+    }
+```
+
+OpenRouter's `HTTP-Referer` and `X-Title` headers are optional but recommended for their analytics. Constants are fine; no env-var override needed in Stage 2.
+
+### 6.8 `src/briefing.py` changes
+
+Only two lines change:
+
+```python
+# BEFORE (Stage 1):
+from src.claude_client import ask_claude
+...
+result = ask_claude(system_prompt, user_message)
+
+# AFTER (Stage 2):
+from src.llm.factory import get_provider
+...
+result = get_provider().complete(system_prompt, user_message)
+```
+
+`result["text"]` and `result["prediction"]` work the same way. The additional `result["provider"]` and `result["model"]` are logged at INFO level for observability but not written to memory in Stage 2 (keeping memory schema stable).
 
 ---
 
-## 8. Dependencies to add
+## 7. Dependencies
 
-In `pyproject.toml`:
+`pyproject.toml` changes:
 
 ```toml
 dependencies = [
-    "anthropic>=0.40.0",
-    "httpx>=0.27.0",
+    "anthropic>=0.40.0",      # still needed — Anthropic SDK has no OpenAI-compat endpoint we want to use
+    "httpx>=0.27.0",          # already present, used by openai_compatible.py
     "jsonschema>=4.0.0",
 ]
-
-[dependency-groups]
-dev = [
-    "pytest>=8.0.0",
-    "pytest-mock>=3.12.0",
-    "freezegun>=1.4.0",    # for testing date-dependent code
-]
 ```
+
+**No new runtime dependency.** We're using `httpx` (already present) to hit the OpenAI-compatible endpoints directly. Adding the `openai` SDK would be a 30+ MB install for one HTTP call we can make in 20 lines. Not worth it.
 
 ---
 
-## 9. GitHub Actions changes
+## 8. GitHub Actions changes
 
-### 9.1 `daily-briefing.yml` — add write-back commit
-
-After the briefing runs, if `memory/episodic/` has new files, commit and push them back to the repo. This is the mechanism that makes memory persistent across runs.
+Both workflows need `LLM_PROVIDER` and the matching key passed in. Example for `daily-briefing.yml`:
 
 ```yaml
-- name: Commit new memory
-  run: |
-    git config user.name "chief-of-staff-bot"
-    git config user.email "bot@users.noreply.github.com"
-    git add memory/episodic/
-    git diff --staged --quiet || git commit -m "memory: briefing for $(date -u +%Y-%m-%d)"
-    git push
+- run: uv run python -m src.briefing
   env:
-    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    LLM_PROVIDER: ${{ vars.LLM_PROVIDER || 'anthropic' }}
+    LLM_MODEL: ${{ vars.LLM_MODEL }}
+    ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+    OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
+    OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+    TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 ```
 
-Workflow needs `permissions: contents: write` at the top.
+`vars.LLM_PROVIDER` is a GitHub repo-level variable (not a secret — it's not sensitive) so you can flip between providers from the GitHub UI without editing workflow YAML. `secrets.*_API_KEY` entries are set for whichever providers you actually use; unused ones can be absent and the factory's validation will still catch the specific missing one.
 
-### 9.2 `ingest-replies.yml` — new workflow
+`ingest_replies.yml` doesn't use the LLM (it's Telegram-only) so it stays unchanged.
 
-```yaml
-name: Ingest Telegram Replies
+---
 
-on:
-  schedule:
-    - cron: "0 */2 * * *"   # every 2 hours
-  workflow_dispatch:
+## 9. Migration path (how Stage 1 tests survive)
 
-permissions:
-  contents: write
+Stage 1 has `tests/test_claude_client.py` with 4 tests. They test `ask_claude` directly. In Stage 2:
 
-jobs:
-  ingest:
-    runs-on: ubuntu-latest
-    timeout-minutes: 3
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv sync --frozen
-      - run: uv run python src/ingest_replies.py
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      - name: Commit ingested replies
-        run: |
-          git config user.name "chief-of-staff-bot"
-          git config user.email "bot@users.noreply.github.com"
-          git add memory/episodic/
-          git diff --staged --quiet || git commit -m "memory: ingest replies $(date -u +%Y-%m-%dT%H:%M)"
-          git push
-```
+1. Delete `tests/test_claude_client.py` (the module it tests no longer exists).
+2. Create `tests/test_provider_anthropic.py` with the same 4 test cases rewritten against `AnthropicProvider.complete()`. Behavior must be identical.
+3. `tests/test_briefing_flow.py` patches `src.briefing.ask_claude`. In Stage 2 it patches `src.briefing.get_provider` to return a mock provider whose `.complete()` returns the mock response. One-line change per test.
+
+This keeps Stage 1's test coverage intact while switching what's being tested.
 
 ---
 
 ## 10. Non-goals (do NOT implement in this stage)
 
-- No `llm/` directory. Do not refactor `claude_client.py` into an abstract interface. That's stage 2.
-- No `memory/semantic/` directory. No projects.md extraction. That's stage 3.
-- No LanceDB, no vector search, no embeddings. That's stage 4.
-- No Neo4j. Maybe never.
-- No pattern/accuracy tracking JSON. That's stage 3.
-- No summarization of yesterday's prediction. Pass through verbatim.
-- No backfill of historical data. Starts empty from first run.
+- **No fallback chains.** If Gemini fails, the run fails. Retry-across-providers is stage 3 at earliest.
+- **No per-task routing.** `briefing.py` and any future tasks all use the same provider. A/B testing comes later.
+- **No provider-native structured-output APIs.** No Gemini `responseSchema`, no OpenAI `json_schema`. The prompt-based fenced-JSON approach is uniform and works everywhere.
+- **No cost tracking or token accounting.** Logging `provider` and `model` is enough; real cost dashboards are a separate project.
+- **No local Ollama support.** Cloud-only in Stage 2. Adding local means adding base-URL config and handling no-auth, which doubles the surface area.
+- **No streaming.** Briefings are short, latency isn't the bottleneck, and streaming complicates JSON extraction.
+- **No config file.** Env vars only. If per-task routing becomes real in stage 3, revisit.
 
 ---
 
 ## 11. Success criteria
 
-All acceptance tests in `TEST_PLAN.md` pass. On first real run, a `memory/episodic/YYYY-MM-DD.md` file appears in git. On second run 24h later, the briefing prompt includes yesterday's JSON verbatim. When user replies to the Telegram message, within 2 hours the reply shows up in that day's markdown file.
+- All Stage 1 tests still pass (either renamed as per section 9, or unchanged).
+- New tests from `TEST_PLAN.md` pass.
+- `LLM_PROVIDER=anthropic` produces byte-identical behavior to pre-refactor.
+- `LLM_PROVIDER=gemini GEMINI_API_KEY=...` produces a valid briefing when run live.
+- Flipping providers requires only an env var change. No code edits.
