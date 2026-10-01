@@ -21,18 +21,23 @@ Every 2 hours, a second workflow ingests Telegram replies and appends them to th
 .
 ├── context/
 │   ├── soul.md          # agent personality and rules
-│   ├── user.md          # who Mohamed is, what he's working on
-│   └── heartbeat.md     # current projects and blockers (update manually)
+│   ├── user.md          # who Mohamed is, what he's working on (stable facts)
+│   ├── heartbeat.md     # intervention policy
+│   └── current_state.md # what is true right now + the next action (state lives here)
 ├── memory/
 │   └── episodic/
 │       ├── .gitkeep
 │       ├── .last_update_id   # tracks last ingested Telegram update
+│       ├── events.jsonl      # append-only log: briefing -> reply -> state_update
 │       ├── 2026-04-17.md
 │       └── ...
 ├── src/
 │   ├── briefing.py       # main entrypoint
 │   ├── telegram_client.py
-│   ├── ingest_replies.py # reads Telegram, appends to day files
+│   ├── ingest_replies.py # reads Telegram, appends to day files + events.jsonl
+│   ├── events.py         # append-only event log, briefing ids, provenance
+│   ├── state.py          # read/write context/current_state.md, next-action rule
+│   ├── state_update.py   # replies -> explicit checkpoint transitions
 │   ├── llm/
 │   │   ├── base.py           # Provider ABC + LLMResponse type
 │   │   ├── factory.py        # get_provider() — reads env, returns provider
@@ -48,6 +53,10 @@ Every 2 hours, a second workflow ingests Telegram replies and appends them to th
 │       ├── episodic.py   # read/write day files
 │       └── schema.py     # JSON prediction schema + validation
 └── tests/
+    ├── loop_support.py             # shared LLM + Telegram stubs
+    ├── run_episodic_loop.py        # manual three-cycle test trigger
+    ├── verify_artifacts.py         # re-derives acceptance criteria from artifacts
+    └── artifacts/episodic-loop-*/  # saved evidence from a manual run
 ```
 
 ## How memory works
@@ -88,9 +97,42 @@ Each file is plain Markdown - readable directly in GitHub. The JSON prediction b
 
 ## Feedback loop via Telegram replies
 
-After each morning briefing, Mohamed can reply in Telegram. The `ingest-replies` workflow runs every 2 hours, fetches new messages, and appends them to the matching day file. The next morning's briefing includes those replies as context.
+After each morning briefing, Mohamed can reply in Telegram. The `ingest-replies` workflow runs every 2 hours, fetches new messages, appends them to the matching day file, and records a `user_reply` event in `events.jsonl` with the briefing it answered (matched on Telegram's `reply_to_message_id`).
 
 Replies that arrive on days without a briefing file (e.g., weekends if the briefing was skipped) go into `memory/episodic/.orphans.md`.
+
+## The state loop
+
+Three stores, three jobs:
+
+| Store | Holds | Written by |
+|---|---|---|
+| `memory/episodic/YYYY-MM-DD.md` | human-readable day record | `briefing.py`, `ingest_replies.py` |
+| `memory/episodic/events.jsonl` | append-only chain: `briefing_sent`, `briefing_delivered`, `user_reply`, `state_update` | `events.py` |
+| `context/current_state.md` | current target, checkpoints, next action, transition log | `state_update.py` |
+
+The day files hold one briefing per Cairo date, so they cannot represent several briefings in a day or mark an event as consumed. `events.jsonl` is therefore the authoritative store for the loop; the day files stay the readable mirror.
+
+Every run of `python -m src.briefing` starts by applying any unconsumed `user_reply` events to `current_state.md`:
+
+1. Split the reply into sentences. For each checkpoint, the **last** sentence mentioning one of its aliases decides.
+2. Within that sentence a negative signal beats a positive one — "it worked, but the next briefing ignored it" must not read as verified.
+3. Only transitions backed by a quoted signal are applied, and each one is appended to the state file's `## Transitions` log with the evidence event id and the exact matched phrase. Nothing is inferred from silence.
+4. The next action is derived mechanically: the first checkpoint that is not `verified`, or `No evidence-backed intervention needed.` when all are verified.
+
+The mandated next action is passed to the model, which must use it and may not re-test anything already marked verified. If the state has not changed since the last briefing delivered today, `briefing.py` skips the send entirely instead of sending a duplicate.
+
+`current_state.md` is safe to edit by hand — the state-update step only applies transitions that new evidence supports. `target_output` is meant to be set by a human.
+
+## Testing the loop end to end
+
+`tests/run_episodic_loop.py` drives the real `src.briefing.main()`, `src.ingest_replies.ingest_update()` and `src.state_update.update_state_from_events()` for three consecutive cycles, stubbing only the two network seams (`get_provider`, `send_telegram_message`) with the same stubs the test suite uses. Saved artifacts from a run land in `tests/artifacts/episodic-loop-<date>/`.
+
+```bash
+uv run pytest tests/ -v                        # 143 tests
+uv run python -m tests.run_episodic_loop       # manual three-cycle run, writes artifacts
+uv run python -m tests.verify_artifacts        # re-check acceptance criteria from the artifacts
+```
 
 ## Choosing a provider
 
@@ -136,7 +178,11 @@ uv run pytest tests/ -v
 
 ## Updating context
 
-Edit `context/heartbeat.md` directly to reflect what's currently in progress. The agent reads it fresh each run. No code changes needed.
+- `context/user.md` — stable facts about Mohamed and his work. The agent reads it fresh each run.
+- `context/heartbeat.md` — intervention policy.
+- `context/current_state.md` — what is true right now. Repoint `target_output` at the next real
+  project and reset the checkpoint values; the agent fills in `next_action`, `last_evidence`,
+  `confidence` and `## Transitions` from evidence.
 
 ## Secrets required
 

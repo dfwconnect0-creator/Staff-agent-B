@@ -1,0 +1,20 @@
+briefing_id: briefing_20261001_002
+telegram_message_id: 5002
+delivered_at_cairo: 2026-10-01 02:00:00
+state_version: 5517146f38c01df8
+next_action: Verify retrieval.
+------------------------------------------------------------
+Current outcome:
+Prove episodic-memory feedback loop: 3 consecutive briefing -> reply -> state change -> changed briefing cycles. Verified: reply_ingestion, storage.
+
+State:
+reply_ingestion = verified | storage = verified | retrieval = not_verified | use_in_decision = not_verified | feedback_loop = not_verified
+
+Mismatch or blocker:
+retrieval is not_verified, which blocks the target output.
+
+Smallest next action:
+Verify retrieval.
+
+Question:
+Does the state above match what you actually observed?

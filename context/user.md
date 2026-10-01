@@ -1,5 +1,19 @@
 # user.md — Profile: Mohamed Salah Bladina
 
+> **Evidence tiers used in this file.** Every claim below belongs to one of these, and an
+> agent must keep them apart rather than collapsing them into one voice:
+>
+> - **Fact** — verifiable outside this file (a date, a shipped thing, a stated role).
+> - **User-stated** — Mohamed said so directly. Highest authority; still a claim, not evidence.
+> - **Observation** — a pattern seen repeatedly in his own writing. Evidence-backed but not confirmed by him.
+> - **Hypothesis** — a possible explanation. Watch it, never assert it, never turn it into a trait.
+>
+> Sections marked *Deeper patterns* are observations or hypotheses unless the text says otherwise.
+>
+> **Scope of this file:** stable information only. Changing project state — current target
+> output, what is verified, next action, blocker — lives in `current_state.md`. Intervention
+> policy lives in `heartbeat.md`. Never put today's state here.
+
 ## Current Reality
 
 Mohamed operates in two roles simultaneously and the boundary between them is blurry by design. He is a digital marketing specialist with 15+ years of experience and a self-taught AI systems builder who has been in the rabbit hole for several years. He runs a services agencies (resume design called samcv, + SEO, PPC, WordPress called artnize), a training business (AI automation courses and workshops for Arabic-speaking markets), and a portfolio of agent projects — see the current list in the "Projects in progress" section below.

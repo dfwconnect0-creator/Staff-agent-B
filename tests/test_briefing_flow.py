@@ -202,7 +202,9 @@ def test_same_day_double_run_does_not_overwrite(tmp_path, capsys):
             result = briefing.main()
 
     assert result == 0
-    assert len(sent) == 1
+    # No new evidence arrived and state_version is unchanged, so the pipeline is a
+    # no-op: the user does not get a second identical briefing on the same day.
+    assert len(sent) == 0
     assert (tmp_path / "2026-04-17.md").read_text() == original_content
 
 

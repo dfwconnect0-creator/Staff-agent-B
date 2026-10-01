@@ -4,27 +4,40 @@ from datetime import datetime, timezone, timedelta
 import httpx
 
 CAIRO_TZ = timezone(timedelta(hours=3))
+TELEGRAM_TIMEOUT = 30.0
 
 
-def send_telegram_message(text: str) -> None:
+def send_telegram_message(text: str) -> int | None:
+    """Send a message. Returns the Telegram message_id, or None if unavailable.
+
+    The message_id is what lets a later reply be traced back to this briefing.
+    """
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     chat_id = os.environ["TELEGRAM_CHAT_ID"]
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    response = httpx.post(url, json={"chat_id": chat_id, "text": text})
+    response = httpx.post(url, json={"chat_id": chat_id, "text": text}, timeout=TELEGRAM_TIMEOUT)
     response.raise_for_status()
+    try:
+        return response.json()["result"]["message_id"]
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def get_updates(since_update_id: int = 0) -> list[dict]:
     """
     Call Telegram getUpdates API. Return list of message dicts:
-    [{"update_id": int, "timestamp_cairo": str, "text": str, "chat_id": int}, ...]
+    [{"update_id": int, "timestamp_cairo": str, "text": str, "chat_id": int,
+      "message_id": int | None, "reply_to_message_id": int | None}, ...]
     Filters to only messages from TELEGRAM_CHAT_ID.
+
+    message_id and reply_to_message_id are preserved as provenance: they are the
+    only stable identifiers that let a reply be linked to the briefing it answered.
     """
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     chat_id = int(os.environ["TELEGRAM_CHAT_ID"])
     url = f"https://api.telegram.org/bot{token}/getUpdates"
     params = {"offset": since_update_id + 1} if since_update_id > 0 else {}
-    response = httpx.get(url, params=params)
+    response = httpx.get(url, params=params, timeout=TELEGRAM_TIMEOUT)
     response.raise_for_status()
     data = response.json()
     updates = []
@@ -39,10 +52,13 @@ def get_updates(since_update_id: int = 0) -> list[dict]:
         ts_unix = msg["date"]
         dt_cairo = datetime.fromtimestamp(ts_unix, tz=CAIRO_TZ)
         timestamp_cairo = dt_cairo.strftime("%Y-%m-%d %H:%M")
+        reply_to = msg.get("reply_to_message") or {}
         updates.append({
             "update_id": item["update_id"],
             "timestamp_cairo": timestamp_cairo,
             "text": msg["text"],
             "chat_id": msg["chat"]["id"],
+            "message_id": msg.get("message_id"),
+            "reply_to_message_id": reply_to.get("message_id"),
         })
     return updates
