@@ -9,7 +9,7 @@ blocker: Live Telegram delivery and reply ingestion have not yet been verified e
 accountability_source: telegram
 last_evidence: none
 confidence: high
-updated_at: 2026-10-01T13:41:18+03:00
+updated_at: 2026-10-01T13:42:45+03:00
 
 ## Checkpoints
 
