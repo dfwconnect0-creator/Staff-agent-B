@@ -7,9 +7,9 @@ target_output: Prove one real bidirectional Staff Agent cycle through GitHub Act
 next_action: Verify state_transition.
 blocker: Live Telegram delivery and reply ingestion have not yet been verified end-to-end.
 accountability_source: telegram
-last_evidence: evt_000008 - user_reply (2026-10-01T15:09:42+03:00)
-confidence: high
-updated_at: 2026-10-01T15:11:02+03:00
+last_evidence: evt_000012 - user_reply (2026-10-01T15:13:50+03:00)
+confidence: low
+updated_at: 2026-10-01T15:14:14+03:00
 
 ## Checkpoints
 
