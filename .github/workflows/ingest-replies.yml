@@ -2,11 +2,19 @@ name: Ingest Telegram Replies
 
 on:
   schedule:
-    - cron: "0 */2 * * *"   # every 2 hours
+    - cron: "*/10 * * * *"   # every 10 minutes (fast interactive mode)
   workflow_dispatch:
 
 permissions:
   contents: write
+
+# Shared with daily-briefing.yml. Both jobs write memory/episodic/ and
+# context/current_state.md and then push to main, so they must never overlap.
+# cancel-in-progress MUST stay false: cancelling a half-finished run could leave
+# the Telegram cursor advanced but the commit un-pushed, silently dropping a reply.
+concurrency:
+  group: staff-agent-memory-writes
+  cancel-in-progress: false
 
 jobs:
   ingest:

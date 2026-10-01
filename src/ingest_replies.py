@@ -1,14 +1,24 @@
 """
 Ingest Telegram replies into episodic memory files and the event log.
 
-Runs on its own cron (every 2 hours). Reads Telegram replies since last
+Runs on its own cron (every 10 minutes). Reads Telegram replies since last
 ingestion, maps each to a day (based on Cairo date of message timestamp),
 appends to that day's memory file, and appends a `user_reply` event to
 `memory/episodic/events.jsonl` carrying the briefing it answered.
 
+Fast interactive mode: when new replies were actually stored, this run also calls
+the existing deterministic state-update step, so `context/current_state.md` is
+refreshed within ~10 minutes instead of waiting for the next daily briefing.
+The transition logic is not reimplemented here -- `src.state_update` is the only
+place that decides a checkpoint changed.
+
+This is a SILENT loop. It never calls the LLM and never sends a Telegram message;
+user-facing briefings stay in `src/briefing.py` / `daily-briefing.yml`. A run with
+no new replies touches nothing at all, so it produces no commit.
+
 State: .last_update_id is committed to git so the Actions workflow can
-read it between runs. Trade-off: adds a small commit every 2 hours when
-there are new messages. Acceptable for v1.
+read it between runs. Trade-off: adds a small commit per run *that found new
+messages*, and nothing at all otherwise.
 """
 
 import logging
@@ -19,6 +29,7 @@ from pathlib import Path
 import src.telegram_client as telegram
 import src.memory.episodic as episodic
 import src.events as events_log
+import src.state_update as state_update_mod
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -90,13 +101,42 @@ def ingest_update(update: dict) -> dict:
     return event
 
 
+def apply_state_update() -> dict:
+    """Run the deterministic state-update step and log what it changed.
+
+    Deliberately delegates to ``src.state_update``: the alias matching, signal
+    tables and provenance rules live there and are shared with the daily briefing.
+    No LLM call, no Telegram send -- a state transition here is silent.
+    """
+    report = state_update_mod.update_state_from_events()
+    for t in report["transitions"]:
+        log.info(
+            f"state change: {t['checkpoint']} {t['from']} -> {t['to']} "
+            f"(evidence {t['evidence_event_id']}, signal '{t['signal']}')"
+        )
+    log.info(
+        f"state_version={report['state_version']} "
+        f"consumed={report['processed_event_ids']} "
+        f"next_action={report['next_action']}"
+    )
+    return report
+
+
 def main() -> int:
     last_id = read_last_update_id()
     updates = telegram.get_updates(since_update_id=last_id)
-    for update in updates:
-        ingest_update(update)
-    if updates:
-        write_last_update_id(max(u["update_id"] for u in updates))
+    if not updates:
+        log.info("no new updates; nothing to ingest, no state change")
+        return 0
+
+    ingested = [ingest_update(update) for update in updates]
+    write_last_update_id(max(u["update_id"] for u in updates))
+
+    # Strict gate: state is only re-derived when a reply was actually stored.
+    # With zero new replies this returns above, so a silent check can never
+    # rewrite current_state.md, append a state_update event, or force a commit.
+    apply_state_update()
+    log.info(f"ingested {len(ingested)} new reply/replies")
     return 0
 
 
