@@ -1,0 +1,156 @@
+name: Diagnose Telegram Pending Updates
+
+# TEMPORARY DIAGNOSTIC. Diagnosis only.
+# Calls Telegram getUpdates in READ-ONLY mode and prints a redacted summary.
+#
+# Read-only guarantee:
+#   * `offset` is deliberately OMITTED. Telegram only confirms (and permanently drops)
+#     updates when the caller passes an offset greater than an update_id. Omitting it
+#     leaves every update pending and unconsumed, so this workflow cannot advance the
+#     cursor or consume anything.
+#   * The repository is never checked out, so no application code, memory file,
+#     current_state.md, events.jsonl or .last_update_id can be read or written.
+#   * No message is sent; getUpdates is the only API method called.
+#
+# Redaction: the bot token, chat_id and sender_id are never printed, nor is the
+# request URL (which embeds the token) nor any raw Telegram JSON.
+# Delete this workflow once the diagnosis is complete.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: List pending updates without consuming them
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python3 - <<'PY'
+          import datetime
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          BASE = "https://api.telegram.org/bot"
+          TARGET_TEXT = "state transition worked."
+          LAST_N = 5
+          CAIRO_OFFSET = datetime.timedelta(hours=3)
+
+
+          def get_updates():
+              """getUpdates with NO offset parameter.
+
+              Omitting `offset` is what makes this non-consuming: Telegram only marks
+              updates confirmed once the caller passes an offset. The request URL embeds
+              the bot token, so it is never returned, logged, or included in any error
+              message -- only the HTTP status code is shown.
+              """
+              url = BASE + os.environ["TELEGRAM_BOT_TOKEN"] + "/getUpdates"
+              try:
+                  with urllib.request.urlopen(url, timeout=20) as resp:
+                      code = resp.getcode()
+                      payload = json.loads(resp.read().decode("utf-8"))
+              except urllib.error.HTTPError as exc:
+                  print(f"getUpdates: HTTP {exc.code}")
+                  return None
+              except Exception:
+                  # Exception text can contain the URL, so it is deliberately discarded.
+                  print("getUpdates: request failed (detail withheld)")
+                  return None
+              if code != 200 or not payload.get("ok"):
+                  print(f"getUpdates: Telegram reported failure (HTTP {code})")
+                  return None
+              return payload.get("result") or []
+
+
+          def to_cairo(unix_ts):
+              if not isinstance(unix_ts, int):
+                  return "unknown"
+              when = datetime.datetime.fromtimestamp(unix_ts, datetime.timezone.utc)
+              return when.astimezone(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") + \
+                     " / " + (when + CAIRO_OFFSET).strftime("%Y-%m-%d %H:%M:%S Cairo")
+
+
+          print("=== Telegram pending-updates diagnostic ===")
+          print("")
+          print("Mode: getUpdates, no offset -> nothing confirmed, nothing consumed.")
+
+          updates = get_updates()
+          if updates is None:
+              print("")
+              print("RESULT: could not read pending updates. Diagnosis aborted.")
+              print("")
+              print("=== end diagnostic ===")
+              raise SystemExit(0)
+
+          print(f"Pending updates returned: {len(updates)}")
+          if not updates:
+              print("")
+              print("There are no pending updates waiting on the bot.")
+              print("")
+              print("RESULT: message \"" + TARGET_TEXT + "\" NOT FOUND - no pending updates at all.")
+              print("")
+              print("=== end diagnostic ===")
+              raise SystemExit(0)
+
+          # Filtered to the configured chat, but the chat id itself is never printed.
+          configured = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+          in_chat = [u for u in updates
+                     if str((u.get("message") or {}).get("chat", {}).get("id", "")) == configured]
+          print(f"Of those, {len(in_chat)} belong to the configured chat.")
+
+          print("")
+          print(f"--- last {LAST_N} updates (fields: update_id, message_id, "
+                "reply_to_message_id, text, timestamp) ---")
+          for u in updates[-LAST_N:]:
+              msg = u.get("message") or {}
+              chat_id = str(msg.get("chat", {}).get("id", ""))
+              text = msg.get("text")
+              reply_to = msg.get("reply_to_message", {}).get("message_id")
+              print(f"  update_id         : {u.get('update_id')}")
+              print(f"  message_id        : {msg.get('message_id')}")
+              print(f"  reply_to_message_id: {reply_to if reply_to is not None else 'none'}")
+              print(f"  text              : {text if text else '<no text / non-text message>'}")
+              print(f"  timestamp         : {to_cairo(msg.get('date'))}")
+              print(f"  configured_chat   : {chat_id == configured if configured else 'unknown'}")
+              print("")
+
+          # Search the configured chat's pending updates for the target message.
+          haystack = []
+          for u in in_chat:
+              msg = u.get("message") or {}
+              if isinstance(msg.get("text"), str):
+                  haystack.append((u, msg))
+
+          needle = TARGET_TEXT.lower()
+          hits = [(u, m) for (u, m) in haystack if needle in m["text"].lower()]
+
+          print("=== search ===")
+          print(f"Looking for a message containing: \"{TARGET_TEXT}\"")
+          if not hits:
+              print("")
+              print("RESULT: NOT FOUND. That message does not exist among the pending "
+                    "updates for this bot/chat. Stop here - do not trigger a briefing yet.")
+          else:
+              print("")
+              print(f"RESULT: FOUND in {len(hits)} pending update(s).")
+              for u, m in hits:
+                  reply_to = m.get("reply_to_message", {}).get("message_id")
+                  print("")
+                  print(f"  update_id          : {u.get('update_id')}")
+                  print(f"  message_id         : {m.get('message_id')}")
+                  print(f"  reply_to_message_id: {reply_to if reply_to is not None else 'none'}")
+                  print(f"  timestamp          : {to_cairo(m.get('date'))}")
+
+          print("")
+          print("=== end diagnostic ===")
+          PY
