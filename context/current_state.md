@@ -1,28 +1,23 @@
 # current_state.md
 
 Operational state for the staff-agent. Changing state lives here, not in `user.md`.
-Rewritten by the state-update step in `src/briefing.py`; safe to edit by hand.
 
-target_output: Prove episodic-memory feedback loop: 3 consecutive briefing -> reply -> state change -> changed briefing cycles.
-next_action: No evidence-backed intervention needed.
-blocker: Reply ingestion has never been run against a live Telegram chat in this project.
+target_output: Prove one real bidirectional Staff Agent cycle through GitHub Actions and Telegram.
+next_action: Verify live_delivery.
+blocker: Live Telegram delivery and reply ingestion have not yet been verified end-to-end.
 accountability_source: telegram
-last_evidence: evt_000011 - user_reply (2026-10-01T06:00:00+03:00)
+last_evidence: none
 confidence: high
-updated_at: 2026-10-01T07:30:00+03:00
+updated_at: 2026-10-01
 
 ## Checkpoints
 
-- reply_ingestion = verified | aliases: reply ingestion
-- storage = verified | aliases: stored, reply was stored
-- retrieval = verified | aliases: retrieval
-- use_in_decision = verified | aliases: retrieved information
-- feedback_loop = verified | aliases: feedback loop
+- live_delivery = not_verified | aliases: live delivery, telegram delivery, briefing received
+- reply_ingestion = not_verified | aliases: reply ingestion, telegram reply
+- state_transition = not_verified | aliases: state transition, state changed
+- changed_next_briefing = not_verified | aliases: changed next briefing, recommendation changed
+- feedback_loop_live = not_verified | aliases: live feedback loop, bidirectional loop
 
 ## Transitions
 
-- 2026-10-01T12:18:32+03:00 | evt_000003 | reply_ingestion: not_verified -> verified | matched 'reply ingestion' + signal 'completed'
-- 2026-10-01T12:18:32+03:00 | evt_000003 | storage: not_verified -> verified | matched 'stored' + signal 'success'
-- 2026-10-01T12:18:32+03:00 | evt_000007 | retrieval: not_verified -> verified | matched 'retrieval' + signal 'worked'
-- 2026-10-01T12:18:32+03:00 | evt_000011 | use_in_decision: not_verified -> verified | matched 'retrieved information' + signal 'correctly'
-- 2026-10-01T12:18:32+03:00 | evt_000011 | feedback_loop: not_verified -> verified | matched 'feedback loop' + signal 'worked'
+None yet.
