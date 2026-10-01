@@ -1,0 +1,78 @@
+name: Diagnose Telegram Destination
+
+# TEMPORARY DIAGNOSTIC. Diagnosis only.
+# Calls Telegram getMe and getChat using the existing repository secrets to identify
+# which bot and which chat this repository is configured to talk to.
+# Sends no message, reads no update, and touches no application code or memory file.
+# Delete this workflow once the destination is identified.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Identify configured Telegram bot and chat
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          BASE = "https://api.telegram.org/bot"
+
+
+          def call(method, params=None):
+              # The request URL embeds the bot token, so it is never returned, logged,
+              # or included in any error message. Only Telegram's status code is shown.
+              url = BASE + os.environ["TELEGRAM_BOT_TOKEN"] + "/" + method
+              if params:
+                  url += "?" + urllib.parse.urlencode(params)
+              try:
+                  with urllib.request.urlopen(url, timeout=20) as resp:
+                      code = resp.getcode()
+                      payload = json.loads(resp.read().decode("utf-8"))
+              except urllib.error.HTTPError as exc:
+                  print(f"{method}: HTTP {exc.code}")
+                  return False, None
+              except Exception:
+                  # Exception text can contain the URL, so it is deliberately discarded.
+                  print(f"{method}: request failed (detail withheld)")
+                  return False, None
+              if code != 200 or not payload.get("ok"):
+                  print(f"{method}: Telegram reported failure (HTTP {code})")
+                  return False, None
+              return True, payload.get("result") or {}
+
+
+          print("=== Telegram destination diagnostic ===")
+
+          ok_me, me = call("getMe")
+          if ok_me:
+              print("")
+              print("BOT")
+              print("  first_name :", me.get("first_name"))
+              print("  username   :", me.get("username"))
+
+          ok_chat, chat = call("getChat", {"chat_id": os.environ.get("TELEGRAM_CHAT_ID", "")})
+          if ok_chat:
+              print("")
+              print("CHAT")
+              print("  type       :", chat.get("type"))
+              print("  title      :", chat.get("title"))
+              print("  first_name :", chat.get("first_name"))
+              print("  username   :", chat.get("username"))
+
+          print("")
+          print("=== end diagnostic ===")
+          PY
