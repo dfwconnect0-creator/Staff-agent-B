@@ -60,6 +60,14 @@ NEGATIVE_SIGNALS = (
     "ignored",
     "wrong",
     "regressed",
+    # Must be checked before the positive `changed`, since `_find_signal` returns the
+    # first negative match. Without these, "nothing changed" / "unchanged" would verify
+    # changed_next_briefing purely because `changed` is a substring of them.
+    "nothing changed",
+    "no change",
+    "unchanged",
+    "not changed",
+    "never changed",
 )
 
 POSITIVE_SIGNALS = (
@@ -81,6 +89,10 @@ POSITIVE_SIGNALS = (
     "done",
     "fine",
     "green",
+    # `changed` is itself the subject of the changed_next_briefing checkpoint, so it is
+    # a confirmation in its own right. Without it, "The recommendation changed
+    # accordingly." matched the alias but produced no signal and therefore no transition.
+    "changed",
 )
 
 MAX_TRANSITION_LOG = 20
@@ -92,12 +104,24 @@ def split_sentences(text: str) -> list[str]:
     return [s.strip() for s in _SENTENCE_SPLIT.split(text) if s.strip()]
 
 
+def _contains_word(haystack: str, phrase: str) -> bool:
+    """True when ``phrase`` appears in ``haystack`` on word boundaries.
+
+    Substring matching let a typo verify a checkpoint: `wworked` contains `worked`, so the
+    real evt_000014 reply verified state_transition even though the user mistyped it.
+    Word-boundary matching keeps `worked`, `worked successfully` and `it worked` working
+    while rejecting `wworked`, `workedd` and `notworked`.
+    """
+    pattern = r"(?<!\w)" + re.escape(phrase) + r"(?!\w)"
+    return re.search(pattern, haystack) is not None
+
+
 def _find_signal(sentence: str) -> str | None:
     lowered = sentence.lower()
-    negative = [s for s in NEGATIVE_SIGNALS if s in lowered]
+    negative = [s for s in NEGATIVE_SIGNALS if _contains_word(lowered, s)]
     if negative:
         return negative[0]
-    positive = [s for s in POSITIVE_SIGNALS if s in lowered]
+    positive = [s for s in POSITIVE_SIGNALS if _contains_word(lowered, s)]
     return positive[0] if positive else None
 
 
@@ -125,7 +149,7 @@ def extract_transitions(text: str, state: dict) -> list[dict]:
         for sentence in sentences:
             lowered = sentence.lower()
             for needle in needles:
-                if needle.lower() in lowered:
+                if _contains_word(lowered, needle.lower()):
                     hit = (sentence, needle)
                     break
         if not hit:
