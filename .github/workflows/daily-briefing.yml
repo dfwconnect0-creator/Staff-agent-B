@@ -34,11 +34,24 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      - name: Rebuild portfolio state
+        # No LLM and no Telegram. Reads the committed per-project state files and
+        # rewrites context/portfolio/current_state.md. Most project sources are local
+        # to the user's machine, so this runner rebuilds from state it already has
+        # rather than pretending to re-read a disk it cannot see.
+        run: uv run python -m src.project_update portfolio
+      - name: Send portfolio briefing
+        # Runs even if the LLM briefing failed, so a provider outage never costs the
+        # human their project check-in. Skips itself when the portfolio is unchanged.
+        run: uv run python -m src.portfolio_briefing --send
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       - name: Commit new memory
         run: |
           git config user.name "chief-of-staff-bot"
           git config user.email "bot@users.noreply.github.com"
-          git add memory/episodic/ context/current_state.md
+          git add memory/episodic/ context/current_state.md context/projects/ context/portfolio/
           git diff --staged --quiet || git commit -m "memory: briefing for $(date -u +%Y-%m-%d)"
           git push
         env:

@@ -12,17 +12,20 @@ already uses: `src.briefing.get_provider` (the LLM) and `src.briefing.send_teleg
 `tests/test_loop_three_cycles.py` also uses, so the manual run and the automated gate
 cannot diverge.
 
-Memory and `context/current_state.md` are written for real, because persistence is part of
-what is being proven. Use --tmp-memory for an isolated run.
+Memory and `context/current_state.md` are written for real inside a temporary
+directory, because persistence is part of what is being proven — but never in the repo.
+The repo's `memory/episodic/` and `context/current_state.md` are not touched by this
+tool; a test must not be able to destroy live state. Written artifacts land in
+`tests/artifacts/episodic-loop-<date>/`.
 
 Usage:
-    uv run python -m tests.run_episodic_loop [--tmp-memory]
+    uv run python -m tests.run_episodic_loop
 """
 
-import argparse
 import json
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -251,12 +254,21 @@ def run(out_dir):
     episodic.MEMORY_DIR = out_dir / "memory"
     (out_dir / "memory").mkdir(parents=True, exist_ok=True)
 
+    # Both the event log and the operational state live inside out_dir. The earlier
+    # version redirected only MEMORY_DIR, so `--tmp-memory` still reset the repo's
+    # real context/current_state.md to a synthetic seed and overwrote the checkpoints
+    # the live loop had earned. A test must never be able to destroy real state, so
+    # the sandbox is now unconditional and the flag is gone.
+    state_mod.DEFAULT_STATE_PATH = out_dir / "current_state.md"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     # Experiment setup, applied once before cycle 1 so the run is reproducible from
     # the repo's live state. No step inside a cycle writes this.
     state_path = reset_state_to_seed(state_mod.DEFAULT_STATE_PATH)
     (ARTIFACT_DIR / "initial_state.md").write_text(
         state_mod.render_state(state_mod.load_state()), encoding="utf-8")
     print(f"memory/episodic -> {episodic.MEMORY_DIR}")
+    print(f"state          -> {state_mod.DEFAULT_STATE_PATH}  (repo files untouched)")
     print(f"starting state seeded at {state_path}")
 
     provider = ScriptedProvider()
@@ -270,10 +282,11 @@ def run(out_dir):
         "src.state_update.update_state_from_events()",
         "stubbed: src.briefing.get_provider (LLM), src.briefing.send_telegram_message (Telegram HTTP)",
         "stubs  : tests/loop_support.py, shared with tests/test_loop_three_cycles.py",
-        "memory : memory/episodic/events.jsonl and context/current_state.md",
+        "memory : sandboxed events.jsonl and current_state.md under a temp dir",
         "",
-        "The run resets context/current_state.md to the experiment seed once, before cycle 1,",
-        "so it is reproducible. Every state change after that is pipeline-written.",
+        "The run runs entirely inside a temp dir: the repo's memory/episodic/ and",
+        "context/current_state.md are never written. The sandbox state is reset to the",
+        "experiment seed once, before cycle 1, so the run is reproducible.",
         "",
         "initial state (context/current_state.md at the start of the run):",
         state_mod.render_state(state_mod.load_state()).rstrip(),
@@ -302,15 +315,11 @@ def run(out_dir):
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tmp-memory", action="store_true",
-                        help="keep the repo's memory/episodic/ clean")
-    args = parser.parse_args()
-
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
-    out_dir = Path("/tmp/episodic-loop-run") if args.tmp_memory else REPO
-    if args.tmp_memory and out_dir.exists():
+    out_dir = Path(tempfile.gettempdir()) / "episodic-loop-run"
+    if out_dir.exists():
         shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True)
     return run(out_dir)
 
 

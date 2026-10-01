@@ -29,6 +29,10 @@ from pathlib import Path
 import src.telegram_client as telegram
 import src.memory.episodic as episodic
 import src.events as events_log
+import src.portfolio as portfolio
+import src.project_routing as routing
+import src.project_update as project_update
+import src.projects as registry
 import src.state_update as state_update_mod
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -62,6 +66,7 @@ def parse_cairo_date(timestamp_cairo: str) -> date:
 
 def append_to_orphans(update: dict) -> None:
     p = _get_memory_dir() / ".orphans.md"
+    p.parent.mkdir(parents=True, exist_ok=True)
     line = f'- **{update["timestamp_cairo"]} Cairo:** "{update["text"]}"\n'
     existing = p.read_text() if p.exists() else "# Orphaned replies\n\nReplies that arrived for days without a briefing file.\n\n"
     if line not in existing:
@@ -101,6 +106,49 @@ def ingest_update(update: dict) -> dict:
     return event
 
 
+def route_reply(update: dict, event: dict) -> dict | None:
+    """Decide whether a reply is about exactly one project, and record that decision.
+
+    Conservative by design. A reply that names no project, or more than one, is left
+    as a user_reply only: it is still stored and still consumed, but it cannot change
+    a project's state. Applying the routing is left to ``src.project_update``, which is
+    the single writer of project state.
+
+    Returns the appended project_evidence event when the reply routed, else None.
+    """
+    catalog = registry.load_registry()
+    if not catalog:
+        return None
+    index = registry.alias_index(catalog)
+    decision = routing.resolve_project(update.get("text", ""), index)
+    if decision["project_id"] is None:
+        log.info(f"reply not routed to a project: {decision['reason']}")
+        return None
+
+    project_id = decision["project_id"]
+    updates = routing.derive_field_updates(update.get("text", ""), project_id, index)
+    routed_event = project_update.record_routed_reply(project_id, event, decision, updates)
+    if not routed_event.get("applied"):
+        log.info(f"routed {event['event_id']} -> {project_id}, no field changed")
+    return routed_event
+
+
+def apply_project_routing(events: list[dict]) -> int:
+    """Route already-ingested replies to projects, oldest first.
+
+    Kept separate from ``ingest_update`` so the write order stays readable: the reply
+    is stored as a user_reply first, then routing is derived from that stored event.
+    """
+    routed = 0
+    for event in events:
+        routing_event = route_reply({"text": event.get("text", "")}, event)
+        if routing_event is None:
+            continue
+        routed += 1
+        log.info(f"routed {event['event_id']} -> {routing_event['project_id']}")
+    return routed
+
+
 def apply_state_update() -> dict:
     """Run the deterministic state-update step and log what it changed.
 
@@ -132,11 +180,22 @@ def main() -> int:
     ingested = [ingest_update(update) for update in updates]
     write_last_update_id(max(u["update_id"] for u in updates))
 
+    # Project routing runs after the replies are stored, so it can point at the event
+    # id of the reply it acted on. A reply naming one project updates that project's
+    # state; anything ambiguous is left alone.
+    routed = apply_project_routing(ingested)
+
     # Strict gate: state is only re-derived when a reply was actually stored.
     # With zero new replies this returns above, so a silent check can never
     # rewrite current_state.md, append a state_update event, or force a commit.
     apply_state_update()
-    log.info(f"ingested {len(ingested)} new reply/replies")
+
+    if routed:
+        states = portfolio.load_states()
+        derived = portfolio.write_state(portfolio.build_state(states))
+        log.info(f"portfolio rebuilt: {derived}")
+
+    log.info(f"ingested {len(ingested)} new reply/replies, {routed} routed to a project")
     return 0
 
 

@@ -30,7 +30,16 @@ EVENT_TYPES = (
     "briefing_delivered",
     "user_reply",
     "state_update",
+    # Version 2 additions. Appending to this tuple is backward compatible: existing
+    # lines in events.jsonl carry only the first four types and are never rewritten.
+    "project_evidence",
+    "project_state_update",
+    "portfolio_update",
 )
+
+BRIEFING_SCOPES = ("staff-agent", "portfolio")
+
+DEFAULT_BRIEFING_SCOPE = "staff-agent"
 
 
 def events_path() -> Path:
@@ -64,7 +73,12 @@ def read_events() -> list[dict]:
 
 
 def append_event(event_type: str, **fields) -> dict:
-    """Append one event and return it as written."""
+    """Append one event and return it as written.
+
+    ``project_id`` defaults to ``staff-agent`` so every Version 1 call site keeps its
+    current behaviour. Version 2 passes a real ``project_id`` for project-scoped
+    evidence, which is the only thing that changes here.
+    """
     if event_type not in EVENT_TYPES:
         raise ValueError(f"Unknown event_type '{event_type}'. Valid: {', '.join(EVENT_TYPES)}")
     events = read_events()
@@ -73,7 +87,7 @@ def append_event(event_type: str, **fields) -> dict:
         "event_id": _next_event_id(events),
         "source": fields.pop("source", "agent"),
         "event_type": event_type,
-        "project_id": PROJECT_ID,
+        "project_id": fields.pop("project_id", PROJECT_ID),
     }
     event.update(fields)
     p = events_path()
@@ -87,10 +101,20 @@ def _next_event_id(events: list[dict]) -> str:
     return f"evt_{len(events) + 1:06d}"
 
 
+CONSUMING_EVENT_TYPES = ("state_update", "project_state_update", "portfolio_update")
+
+
 def _apply_processed_flags(events: list[dict]) -> None:
+    """Derive the effective `processed` flag from later consumption events.
+
+    Any event that lists an id in its `consumes` marks that id consumed, whatever its
+    own type. Version 1 had a single consumer (`state_update`); Version 2 adds
+    project- and portfolio-scoped consumers, and a reply routed to a project must stay
+    visible to the project layer until the project consumes it.
+    """
     consumed: set[str] = set()
     for e in events:
-        if e.get("event_type") == "state_update":
+        if e.get("event_type") in CONSUMING_EVENT_TYPES:
             consumed.update(e.get("consumes", []))
     for e in events:
         if e.get("event_type") == "user_reply":
@@ -132,10 +156,16 @@ def briefings_for_day(day) -> list[dict]:
     ]
 
 
-def last_delivered_briefing(day) -> dict | None:
-    """The most recent briefing for this Cairo date that Telegram actually accepted."""
+def last_delivered_briefing(day, scope: str = "staff-agent") -> dict | None:
+    """The most recent briefing for this Cairo date that Telegram actually accepted.
+
+    Scoped, so the staff-agent loop never mistakes a portfolio briefing for its own
+    delivered message. Version 1 events carry no scope and count as ``staff-agent``.
+    """
     delivered = {e["briefing_id"] for e in read_events() if e.get("event_type") == "briefing_delivered"}
-    candidates = [e for e in briefings_for_day(day) if e.get("briefing_id") in delivered]
+    candidates = [
+        e for e in briefings_for_day(day) if e.get("briefing_id") in delivered and briefing_scope(e) == scope
+    ]
     return candidates[-1] if candidates else None
 
 
@@ -170,3 +200,75 @@ def has_reply_provenance(event: dict) -> bool:
     so older malformed events that were linked by a fallback are correctly rejected.
     """
     return resolve_reply_briefing(event.get("reply_to_message_id")) is not None
+
+
+def briefing_scope(event: dict) -> str:
+    """Which layer a briefing belongs to.
+
+    Version 1 briefings carry no scope and default to ``staff-agent``, so every existing
+    line in the log keeps its original meaning.
+    """
+    scope = event.get("briefing_scope")
+    return scope if scope in BRIEFING_SCOPES else DEFAULT_BRIEFING_SCOPE
+
+
+def resolve_reply_target(reply_to_message_id) -> tuple[str | None, str]:
+    """Resolve a Telegram reply to ``(briefing_id, briefing_scope)``."""
+    if reply_to_message_id is None:
+        return None, DEFAULT_BRIEFING_SCOPE
+    for e in reversed(read_events()):
+        if (
+            e.get("event_type") == "briefing_delivered"
+            and e.get("telegram_message_id") is not None
+            and e["telegram_message_id"] == reply_to_message_id
+        ):
+            scope = briefing_scope(e)
+            if "briefing_scope" not in e:
+                # The delivered event may predate scoping, or the scope may only have
+                # been recorded on the matching send. Falling back to "staff-agent"
+                # would silently reclassify a portfolio briefing, so look it up.
+                scope = _scope_from_sent(e.get("briefing_id")) or scope
+            return e.get("briefing_id"), scope
+    return None, DEFAULT_BRIEFING_SCOPE
+
+
+def _scope_from_sent(briefing_id) -> str | None:
+    if not briefing_id:
+        return None
+    for e in reversed(read_events()):
+        if e.get("event_type") == "briefing_sent" and e.get("briefing_id") == briefing_id:
+            return e["briefing_scope"] if e.get("briefing_scope") in BRIEFING_SCOPES else None
+    return None
+
+
+# --- Version 2: project-scoped queries -------------------------------------------
+
+
+def project_events(project_id: str, event_types: tuple[str, ...] | None = None) -> list[dict]:
+    """Every event recorded for one project, in write order."""
+    return [
+        e
+        for e in read_events()
+        if e.get("project_id") == project_id
+        and (event_types is None or e.get("event_type") in event_types)
+    ]
+
+
+def unconsumed_evidence(project_id: str) -> list[dict]:
+    """Project evidence that no project_state_update has consumed yet."""
+    consumed: set[str] = set()
+    for e in read_events():
+        if e.get("event_type") == "project_state_update":
+            consumed.update(e.get("consumes", []))
+    return [
+        e
+        for e in read_events()
+        if e.get("project_id") == project_id
+        and e.get("event_type") == "project_evidence"
+        and e["event_id"] not in consumed
+    ]
+
+
+def last_project_evidence(project_id: str) -> dict | None:
+    evidence = project_events(project_id, ("project_evidence",))
+    return evidence[-1] if evidence else None

@@ -210,6 +210,7 @@ def main() -> int:
         "briefing_sent",
         source="agent",
         briefing_id=briefing_id,
+        briefing_scope="staff-agent",
         state_version=report["state_version"],
         next_action=state["next_action"],
         prediction=prediction,
@@ -223,6 +224,7 @@ def main() -> int:
         "briefing_delivered",
         source="telegram",
         briefing_id=briefing_id,
+        briefing_scope="staff-agent",
         telegram_message_id=message_id,
         delivered=message_id is not None,
     )

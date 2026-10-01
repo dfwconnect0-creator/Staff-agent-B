@@ -9,7 +9,7 @@ blocker: Reply ingestion has never been run against a live Telegram chat in this
 accountability_source: telegram
 last_evidence: evt_000003 - user_reply (2026-10-01T04:00:00+03:00)
 confidence: high
-updated_at: 2026-10-01T12:18:32+03:00
+updated_at: 2026-10-01T18:28:23+03:00
 
 ## Checkpoints
 
@@ -21,5 +21,5 @@ updated_at: 2026-10-01T12:18:32+03:00
 
 ## Transitions
 
-- 2026-10-01T12:18:32+03:00 | evt_000003 | reply_ingestion: not_verified -> verified | matched 'reply ingestion' + signal 'completed'
-- 2026-10-01T12:18:32+03:00 | evt_000003 | storage: not_verified -> verified | matched 'stored' + signal 'success'
+- 2026-10-01T18:28:23+03:00 | evt_000003 | reply_ingestion: not_verified -> verified | matched 'reply ingestion' + signal 'completed'
+- 2026-10-01T18:28:23+03:00 | evt_000003 | storage: not_verified -> verified | matched 'stored' + signal 'stored'

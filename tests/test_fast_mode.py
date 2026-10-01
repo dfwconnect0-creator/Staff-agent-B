@@ -362,6 +362,7 @@ def test_G_ingest_never_imports_briefing_or_llm():
     source = (REPO_ROOT / "src" / "ingest_replies.py").read_text(encoding="utf-8")
     for forbidden in ("import src.briefing", "from src.briefing",
                       "from src.llm", "import src.llm",
+                      "from src.portfolio_briefing", "import src.portfolio_briefing",
                       "send_telegram_message", "get_provider"):
         assert forbidden not in source, f"ingest must not reference {forbidden}"
 

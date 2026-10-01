@@ -28,11 +28,11 @@ and the briefing reports no mismatch. Re-running immediately afterwards sent 0 m
 
 ## State transitions recorded by the pipeline
 
-- 2026-10-01T12:18:32+03:00 | evt_000003 | reply_ingestion: not_verified -> verified | matched 'reply ingestion' + signal 'completed'
-- 2026-10-01T12:18:32+03:00 | evt_000003 | storage: not_verified -> verified | matched 'stored' + signal 'success'
-- 2026-10-01T12:18:32+03:00 | evt_000007 | retrieval: not_verified -> verified | matched 'retrieval' + signal 'worked'
-- 2026-10-01T12:18:32+03:00 | evt_000011 | use_in_decision: not_verified -> verified | matched 'retrieved information' + signal 'correctly'
-- 2026-10-01T12:18:32+03:00 | evt_000011 | feedback_loop: not_verified -> verified | matched 'feedback loop' + signal 'worked'
+- 2026-10-01T18:28:23+03:00 | evt_000003 | reply_ingestion: not_verified -> verified | matched 'reply ingestion' + signal 'completed'
+- 2026-10-01T18:28:23+03:00 | evt_000003 | storage: not_verified -> verified | matched 'stored' + signal 'stored'
+- 2026-10-01T18:28:23+03:00 | evt_000007 | retrieval: not_verified -> verified | matched 'retrieval' + signal 'worked'
+- 2026-10-01T18:28:23+03:00 | evt_000011 | use_in_decision: not_verified -> verified | matched 'retrieved information' + signal 'correctly'
+- 2026-10-01T18:28:23+03:00 | evt_000011 | feedback_loop: not_verified -> verified | matched 'feedback loop' + signal 'worked'
 
 ## Honest limitations
 
