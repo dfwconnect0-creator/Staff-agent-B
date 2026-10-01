@@ -1,6 +1,7 @@
 # current_state.md
 
 Operational state for the staff-agent. Changing state lives here, not in `user.md`.
+Rewritten by the state-update step in `src/briefing.py`; safe to edit by hand.
 
 target_output: Prove one real bidirectional Staff Agent cycle through GitHub Actions and Telegram.
 next_action: Verify live_delivery.
@@ -8,7 +9,7 @@ blocker: Live Telegram delivery and reply ingestion have not yet been verified e
 accountability_source: telegram
 last_evidence: none
 confidence: high
-updated_at: 2026-10-01
+updated_at: 2026-10-01T13:41:18+03:00
 
 ## Checkpoints
 
