@@ -140,22 +140,33 @@ def last_delivered_briefing(day) -> dict | None:
 
 
 def resolve_reply_briefing(reply_to_message_id) -> str | None:
-    """Resolve which briefing a reply answered. Must be called *before* the reply
-    is appended, so "most recent briefing so far" means "most recent before this
-    reply".
+    """Resolve which briefing a reply answered, from direct Telegram provenance only.
 
-    Preferred: the briefing whose delivered Telegram message_id equals the reply's
-    ``reply_to_message_id``. Falls back to the most recent briefing sent, which
-    covers replies typed without an explicit reply-to.
+    A message links to a briefing only when ``reply_to_message_id`` matches the
+    ``telegram_message_id`` of a ``briefing_delivered`` event. Anything else — no
+    ``reply_to_message_id`` at all, or a reply-to that was never a delivered briefing —
+    resolves to None.
+
+    Such a message is still stored as an event; it simply cannot be treated as evidence
+    about a briefing. Falling back to "most recent briefing sent" made an ordinary
+    message look like an answer to a briefing it never referenced (evt_000003).
     """
-    events = read_events()
-    if reply_to_message_id is not None:
-        for e in reversed(events):
-            if (
-                e.get("event_type") == "briefing_delivered"
-                and e.get("telegram_message_id") is not None
-                and e["telegram_message_id"] == reply_to_message_id
-            ):
-                return e.get("briefing_id")
-    briefings = [e for e in events if e.get("event_type") == "briefing_sent"]
-    return briefings[-1].get("briefing_id") if briefings else None
+    if reply_to_message_id is None:
+        return None
+    for e in reversed(read_events()):
+        if (
+            e.get("event_type") == "briefing_delivered"
+            and e.get("telegram_message_id") is not None
+            and e["telegram_message_id"] == reply_to_message_id
+        ):
+            return e.get("briefing_id")
+    return None
+
+
+def has_reply_provenance(event: dict) -> bool:
+    """True when this event is a direct Telegram reply to a briefing that was delivered.
+
+    Checked against the event log rather than against the event's own ``briefing_id``,
+    so older malformed events that were linked by a fallback are correctly rejected.
+    """
+    return resolve_reply_briefing(event.get("reply_to_message_id")) is not None

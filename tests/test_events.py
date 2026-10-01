@@ -103,15 +103,38 @@ def test_reply_to_message_id_links_the_reply_to_its_briefing(tmp_path):
     assert events_log.resolve_reply_briefing(5001) == "briefing_20261001_001"
 
 
-def test_reply_to_unknown_message_falls_back_to_latest_briefing(tmp_path):
+def test_message_without_reply_to_is_never_linked_to_a_briefing(tmp_path):
+    """Regression: no fallback to "most recent briefing".
+
+    An ordinary Telegram message used to inherit the latest briefing_id, which let it
+    count as briefing evidence (evt_000003 on the live log).
+    """
     events_log.append_event("briefing_sent", briefing_id="briefing_20261001_001")
     events_log.append_event("briefing_delivered", briefing_id="briefing_20261001_001",
                             telegram_message_id=5001)
     events_log.append_event("briefing_sent", briefing_id="briefing_20261001_002")
     events_log.append_event("briefing_delivered", briefing_id="briefing_20261001_002",
                             telegram_message_id=5002)
-    assert events_log.resolve_reply_briefing(None) == "briefing_20261001_002"
+
+    assert events_log.resolve_reply_briefing(None) is None
+    # a reply-to that was never a delivered briefing is not provenance either
+    assert events_log.resolve_reply_briefing(9999) is None
+    # only a real direct reply resolves
     assert events_log.resolve_reply_briefing(5001) == "briefing_20261001_001"
+
+
+def test_has_reply_provenance_ignores_the_events_own_briefing_id(tmp_path):
+    events_log.append_event("briefing_sent", briefing_id="briefing_20261001_001")
+    events_log.append_event("briefing_delivered", briefing_id="briefing_20261001_001",
+                            telegram_message_id=157)
+
+    linked = events_log.append_event("user_reply", text="hi", briefing_id="briefing_20261001_001",
+                                     reply_to_message_id=157)
+    malformed = events_log.append_event("user_reply", text="hi", briefing_id="briefing_20261001_001",
+                                        reply_to_message_id=None)
+
+    assert events_log.has_reply_provenance(linked) is True
+    assert events_log.has_reply_provenance(malformed) is False
 
 
 def test_last_delivered_briefing_ignores_briefings_that_were_never_delivered(tmp_path):

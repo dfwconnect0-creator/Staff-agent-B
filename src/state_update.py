@@ -167,8 +167,14 @@ def update_state_from_events(state_path=None) -> dict:
     state = state_mod.load_state(state_path)
     pending = events_log.unprocessed_replies()
 
+    # Only a direct Telegram reply may act as briefing evidence. An ordinary message is
+    # still stored and still consumed, but must never mutate operational state. Eligibility
+    # is re-derived from the event log rather than trusted from the event's own
+    # briefing_id, so older malformed events that were linked by a fallback are rejected too.
+    eligible = [e for e in pending if events_log.has_reply_provenance(e)]
+
     transitions = []
-    for event in pending:
+    for event in eligible:
         for t in extract_transitions(event.get("text", ""), state):
             transitions.append({**t, "evidence_event_id": event["event_id"]})
 
@@ -186,8 +192,8 @@ def update_state_from_events(state_path=None) -> dict:
 
     state["next_action"] = state_mod.next_action_from_state(state)
     state["updated_at"] = datetime.now(CAIRO_TZ).isoformat(timespec="seconds")
-    if pending:
-        state["last_evidence"] = _describe(pending[-1])
+    if eligible:
+        state["last_evidence"] = _describe(eligible[-1])
         state["confidence"] = "high" if transitions else "low"
 
     state_mod.write_state(state, state_path)
@@ -202,6 +208,7 @@ def update_state_from_events(state_path=None) -> dict:
 
     return {
         "processed_event_ids": [e["event_id"] for e in pending],
+        "evidence_event_ids": [e["event_id"] for e in eligible],
         "transitions": transitions,
         "state_version": version,
         "next_action": state["next_action"],

@@ -48,6 +48,38 @@ def tmp_dirs(tmp_path, monkeypatch):
     return state_file
 
 
+_replied = []
+
+
+def append_linked_reply(text):
+    """Append a user_reply carrying real Telegram reply provenance.
+
+    State processing only trusts a reply that is a direct reply to a briefing that was
+    actually delivered, so this helper creates that provenance explicitly. Previously these
+    tests appended replies with no provenance at all and passed only because
+    `resolve_reply_briefing` used to fall back to "most recent briefing sent".
+    """
+    _replied.append(1)
+    n = len(_replied)
+    briefing_id = f"briefing_20261001_{n:03d}"
+    delivered_message_id = 1000 + n
+    events_log.append_event("briefing_sent", briefing_id=briefing_id, state_version="v1")
+    events_log.append_event(
+        "briefing_delivered",
+        briefing_id=briefing_id,
+        telegram_message_id=delivered_message_id,
+        delivered=True,
+    )
+    return events_log.append_event(
+        "user_reply",
+        processed=False,
+        text=text,
+        briefing_id=briefing_id,
+        telegram_message_id=2000 + n,
+        reply_to_message_id=delivered_message_id,
+    )
+
+
 # --- sentence handling -------------------------------------------------------
 
 def test_sentences_split_on_punctuation():
@@ -128,7 +160,7 @@ def test_no_events_leaves_state_untouched(tmp_path):
 
 
 def test_cycle_1_reply_moves_exactly_two_checkpoints(tmp_path):
-    events_log.append_event("user_reply", processed=False, text=CYCLE_REPLIES[1])
+    append_linked_reply(CYCLE_REPLIES[1])
     report = su.update_state_from_events()
     cps = state_mod.load_state()["checkpoints"]
     assert cps["reply_ingestion"] == "verified"
@@ -139,15 +171,15 @@ def test_cycle_1_reply_moves_exactly_two_checkpoints(tmp_path):
 
 
 def test_cycle_1_sets_next_action_to_retrieval(tmp_path):
-    events_log.append_event("user_reply", processed=False, text=CYCLE_REPLIES[1])
+    append_linked_reply(CYCLE_REPLIES[1])
     su.update_state_from_events()
     assert state_mod.load_state()["next_action"] == "Verify retrieval."
 
 
 def test_cycle_2_reply_moves_retrieval_and_use_in_decision(tmp_path):
-    events_log.append_event("user_reply", processed=False, text=CYCLE_REPLIES[1])
+    append_linked_reply(CYCLE_REPLIES[1])
     su.update_state_from_events()
-    events_log.append_event("user_reply", processed=False, text=CYCLE_REPLIES[2])
+    append_linked_reply(CYCLE_REPLIES[2])
     su.update_state_from_events()
     cps = state_mod.load_state()["checkpoints"]
     assert cps == {
@@ -162,7 +194,7 @@ def test_cycle_2_reply_moves_retrieval_and_use_in_decision(tmp_path):
 
 def test_cycle_3_reply_verifies_everything(tmp_path):
     for i in (1, 2, 3):
-        events_log.append_event("user_reply", processed=False, text=CYCLE_REPLIES[i])
+        append_linked_reply(CYCLE_REPLIES[i])
         su.update_state_from_events()
     cps = state_mod.load_state()["checkpoints"]
     assert all(v == "verified" for v in cps.values())
@@ -170,25 +202,25 @@ def test_cycle_3_reply_verifies_everything(tmp_path):
 
 
 def test_state_transition_is_recorded_inside_the_state_file(tmp_path):
-    events_log.append_event("user_reply", processed=False, text=CYCLE_REPLIES[1])
+    reply = append_linked_reply(CYCLE_REPLIES[1])
     su.update_state_from_events()
     raw = tmp_path.joinpath("current_state.md").read_text(encoding="utf-8")
     assert "reply_ingestion: not_verified -> verified" in raw
     assert "storage: not_verified -> verified" in raw
-    assert "evt_000001" in raw
+    assert reply["event_id"] in raw
 
 
 def test_events_are_marked_processed_only_after_the_state_is_written(tmp_path):
-    events_log.append_event("user_reply", processed=False, text=CYCLE_REPLIES[1])
+    reply = append_linked_reply(CYCLE_REPLIES[1])
     su.update_state_from_events()
     assert events_log.unprocessed_replies() == []
     update = [e for e in events_log.read_events() if e["event_type"] == "state_update"][0]
-    assert update["consumes"] == ["evt_000001"]
+    assert update["consumes"] == [reply["event_id"]]
     assert update["state_version"]
 
 
 def test_running_the_state_update_twice_is_a_no_op(tmp_path):
-    events_log.append_event("user_reply", processed=False, text=CYCLE_REPLIES[1])
+    append_linked_reply(CYCLE_REPLIES[1])
     first = su.update_state_from_events()
     second = su.update_state_from_events()
     assert first["transitions"]
@@ -197,13 +229,13 @@ def test_running_the_state_update_twice_is_a_no_op(tmp_path):
 
 
 def test_reply_that_supports_no_change_leaves_confidence_low(tmp_path):
-    events_log.append_event("user_reply", processed=False, text="Unrelated small talk.")
+    append_linked_reply("Unrelated small talk.")
     report = su.update_state_from_events()
     assert report["transitions"] == []
     assert state_mod.load_state()["confidence"] == "low"
 
 
 def test_last_evidence_points_at_the_consumed_event(tmp_path):
-    events_log.append_event("user_reply", processed=False, text=CYCLE_REPLIES[1])
+    reply = append_linked_reply(CYCLE_REPLIES[1])
     su.update_state_from_events()
-    assert state_mod.load_state()["last_evidence"].startswith("evt_000001 - user_reply")
+    assert state_mod.load_state()["last_evidence"].startswith(f"{reply['event_id']} - user_reply")
