@@ -2,6 +2,7 @@
 """Autonomous local project watcher."""
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -16,9 +17,10 @@ CAIRO_TZ = timezone(timedelta(hours=3))
 REPO_ROOT = Path(__file__).parent.parent
 XDG_RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR")
 if XDG_RUNTIME_DIR:
-    LOCK_PATH = Path(XDG_RUNTIME_DIR) / "staff-agent" / "watcher.lock"
+    LOCK_DIR = Path(XDG_RUNTIME_DIR) / "staff-agent"
 else:
-    LOCK_PATH = Path.home() / ".local" / "state" / "staff-agent" / "watcher.lock"
+    LOCK_DIR = Path.home() / ".local" / "state" / "staff-agent"
+LOCK_PATH = LOCK_DIR / "watcher.lock"
 
 PENDING_OBS_PATH = Path.home() / ".local" / "state" / "staff-agent" / "pending-observations.json"
 UNCERTAIN_OBS_PATH = Path.home() / ".local" / "state" / "staff-agent" / "uncertain-observations.json"
@@ -29,43 +31,71 @@ def now_cairo() -> str:
 
 
 def ensure_dirs():
-    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LOCK_DIR.mkdir(parents=True, exist_ok=True)
     PENDING_OBS_PATH.parent.mkdir(parents=True, exist_ok=True)
     UNCERTAIN_OBS_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
+_lock_fd = None
+
+
 def acquire_lock() -> bool:
     ensure_dirs()
+    global _lock_fd
     try:
-        LOCK_PATH.write_text(str(os.getpid()), encoding="utf-8")
+        _lock_fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return True
     except Exception:
+        if _lock_fd is not None:
+            try:
+                os.close(_lock_fd)
+            except Exception:
+                pass
+            _lock_fd = None
         return False
 
 
 def release_lock():
-    try:
-        LOCK_PATH.unlink(missing_ok=True)
-    except Exception:
-        pass
+    global _lock_fd
+    if _lock_fd is not None:
+        try:
+            fcntl.flock(_lock_fd, fcntl.LOCK_UN)
+            os.close(_lock_fd)
+        except Exception:
+            pass
+        _lock_fd = None
 
 
 def load_json(path: Path) -> list[dict]:
     ensure_dirs()
     try:
         if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
+            data = path.read_text(encoding="utf-8")
+            return json.loads(data) if data.strip() else []
     except Exception:
-        pass
+        # Fail closed - don't silently corrupt
+        raise
     return []
 
 
 def save_json(path: Path, data: list[dict]):
     ensure_dirs()
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    content = json.dumps(data, indent=2, ensure_ascii=False)
     try:
-        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.write_text(content, encoding="utf-8")
+        os.fsync(tmp.fileno())
+        os.replace(str(tmp), str(path))
+        with open(str(path), 'rb') as f:
+            os.fsync(f.fileno())
     except Exception:
-        pass
+        try:
+            if tmp.exists():
+                tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
 
 
 def clear_json(path: Path):
@@ -231,7 +261,6 @@ def find_runs_since(cutoff_seconds: int = 300) -> list[dict]:
 
 
 def dispatch_workflow_safe(payload: dict) -> tuple[str, dict | None]:
-    """Return status: 'dispatched', 'accepted', 'no_run', 'uncertain', 'failed' and extra info."""
     corr_id = generate_correlation_id(payload)
     payload_with_corr = dict(payload)
     payload_with_corr["correlation_id"] = corr_id
@@ -264,13 +293,160 @@ def dispatch_workflow_safe(payload: dict) -> tuple[str, dict | None]:
     except Exception:
         dispatch_failed = True
 
-    if dispatch_failed:
-        runs = find_runs_since(300)
-        if runs:
-            return "accepted", {"correlation_id": corr_id, "recent_runs": len(runs)}
-        return "no_run", {"correlation_id": corr_id}
-
     runs = find_runs_since(300)
     if runs:
         return "accepted", {"correlation_id": corr_id, "recent_runs": len(runs)}
     return "no_run", {"correlation_id": corr_id}
+
+
+def reconcile_uncertain():
+    try:
+        uncertain = load_uncertain()
+        if not uncertain:
+            return
+    except Exception:
+        # Fail closed - don't corrupt
+        return
+    try:
+        runs = find_runs_since(600)
+        if runs:
+            clear_uncertain()
+            return
+    except Exception:
+        pass
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--force-dispatch", action="store_true")
+    args = parser.parse_args()
+
+    if not acquire_lock():
+        print("watcher already running, exiting", file=sys.stderr)
+        return 0
+
+    try:
+        repo_state = refresh_local_repo_safely()
+        if not repo_state["ok"]:
+            if repo_state["dirty"]:
+                print(f"repo not clean, skipping: {repo_state['reason']}", file=sys.stderr)
+            else:
+                print(f"repo refresh failed: {repo_state['reason']}", file=sys.stderr)
+            return 0
+
+        sys.path.insert(0, str(REPO_ROOT))
+        import src.projects as registry
+        import src.project_sources as sources
+        import src.project_state as project_state
+        import src.events as events_log
+
+        reconcile_uncertain()
+
+        catalog = registry.load_registry()
+        eligible = []
+        for pid, entry in catalog.items():
+            if entry.tracking != "active":
+                continue
+            if entry.evidence_source in ("event_only",):
+                continue
+            if entry.refreshable_in_actions == "no":
+                eligible.append((pid, entry))
+
+        try:
+            pending = load_pending()
+        except Exception:
+            pending = []
+        try:
+            uncertain = load_uncertain()
+        except Exception:
+            uncertain = []
+
+        changed_observations = []
+        for pid, entry in eligible:
+            try:
+                report = sources.inspect(pid, entry.evidence_source, entry.evidence_path)
+            except Exception:
+                continue
+            obs = make_observation(pid, report)
+            previous = events_log.last_project_evidence(pid)
+            identical = bool(
+                previous
+                and previous.get("fresh") == obs["fresh"]
+                and previous.get("reason") == obs["reason"]
+                and previous.get("facts") == obs["facts"]
+            )
+            if not identical:
+                changed_observations.append(obs)
+
+        all_to_dispatch = list(pending) + list(uncertain)
+        for obs in changed_observations:
+            d = observation_digest(obs)
+            if not any(observation_digest(p) == d for p in all_to_dispatch):
+                all_to_dispatch.append(obs)
+
+        if args.dry_run:
+            print(json.dumps({"eligible": len(eligible), "inspected": len(eligible), "changed": len(changed_observations), "pending": len(pending), "uncertain": len(uncertain), "would_dispatch": len(all_to_dispatch), "to_dispatch": len(all_to_dispatch)}, indent=2))
+            return 0
+
+        if not all_to_dispatch:
+            try:
+                clear_pending()
+                clear_uncertain()
+            except Exception:
+                pass
+            return 0
+
+        payload = {
+            "schema_version": 1,
+            "observations": all_to_dispatch[:50],
+        }
+
+        if args.force_dispatch:
+            print(json.dumps(payload, indent=2))
+            try:
+                clear_pending()
+                clear_uncertain()
+            except Exception:
+                pass
+            return 0
+
+        status, info = dispatch_workflow_safe(payload)
+        if status == "dispatched" or status == "accepted":
+            try:
+                clear_pending()
+                clear_uncertain()
+            except Exception:
+                pass
+            print(f"dispatched/accepted {len(all_to_dispatch)} observations: {status}")
+            return 0
+        elif status == "no_run":
+            try:
+                save_pending(all_to_dispatch)
+                clear_uncertain()
+            except Exception:
+                pass
+            print(f"dispatch failed, queued as pending: no remote run found", file=sys.stderr)
+            return 1
+        elif status == "uncertain":
+            try:
+                save_uncertain(all_to_dispatch)
+                clear_pending()
+            except Exception:
+                pass
+            print(f"dispatch uncertain, queued for reconciliation", file=sys.stderr)
+            return 1
+        else:
+            try:
+                save_pending(all_to_dispatch)
+                clear_uncertain()
+            except Exception:
+                pass
+            print(f"dispatch failed, queued: {status}", file=sys.stderr)
+            return 1
+    finally:
+        release_lock()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -23,6 +23,9 @@ jobs:
   apply:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    env:
+      OBSERVATION_PAYLOAD: ${{ inputs.payload }}
+      OBSERVATION_CORRELATION_ID: ${{ inputs.correlation_id }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -30,7 +33,10 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --frozen
       - name: Apply observations
-        run: uv run python -m src.project_observation apply --payload '${{ inputs.payload }}' --correlation-id '${{ inputs.correlation_id }}'
+        run: uv run python -m src.project_observation apply
+        env:
+          OBSERVATION_PAYLOAD: ${{ env.OBSERVATION_PAYLOAD }}
+          OBSERVATION_CORRELATION_ID: ${{ env.OBSERVATION_CORRELATION_ID }}
       - name: Commit changes
         run: |
           git config user.name "chief-of-staff-bot"

@@ -8,6 +8,7 @@ Telegram sends.
 
 import argparse
 import json
+import os
 import sys
 
 import src.events as events_log
@@ -28,12 +29,11 @@ def apply_observation(obs: dict, catalog) -> tuple[bool, str]:
     if not pid:
         return False, "missing project_id"
     entry = catalog.get(pid)
-    if entry is None:
+    if not entry:
         return False, f"unknown project_id: {pid}"
     if entry.tracking != "active":
         return False, f"project not active: {pid}"
 
-    # Re-construct report from observation for comparison
     facts = obs.get("facts", [])
     report = {
         "source": obs.get("source_type", entry.evidence_source),
@@ -117,32 +117,23 @@ def apply_payload(payload: dict) -> int:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=["apply"])
-    parser.add_argument("--payload", required=False)
-    parser.add_argument("--payload-file", required=False)
-    parser.add_argument("--correlation-id", required=False)
     args = parser.parse_args()
 
     if args.command == "apply":
         payload = None
-        if args.payload:
+        env_payload = os.environ.get("OBSERVATION_PAYLOAD") or os.environ.get("PAYLOAD")
+        if env_payload:
             try:
-                payload = json.loads(args.payload)
+                payload = json.loads(env_payload)
             except Exception as e:
-                _log(f"failed to parse payload: {e}")
-                return 1
-        elif args.payload_file:
-            try:
-                payload = json.loads(Path(args.payload_file).read_text())
-            except Exception as e:
-                _log(f"failed to parse payload file: {e}")
+                _log(f"failed to parse payload from env: {e}")
                 return 1
         else:
-            _log("missing --payload or --payload-file")
+            _log("missing payload")
             return 1
         return apply_payload(payload)
     return 0
 
 
 if __name__ == "__main__":
-    from pathlib import Path
     sys.exit(main())
