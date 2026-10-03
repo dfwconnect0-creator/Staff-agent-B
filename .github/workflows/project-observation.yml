@@ -7,6 +7,10 @@ on:
         description: "JSON payload of observations"
         required: true
         type: string
+      correlation_id:
+        description: "Correlation ID for dispatch tracking"
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -26,7 +30,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --frozen
       - name: Apply observations
-        run: uv run python -m src.project_observation apply --payload '${{ inputs.payload }}'
+        run: uv run python -m src.project_observation apply --payload '${{ inputs.payload }}' --correlation-id '${{ inputs.correlation_id }}'
       - name: Commit changes
         run: |
           git config user.name "chief-of-staff-bot"

@@ -119,6 +119,7 @@ def main():
     parser.add_argument("command", choices=["apply"])
     parser.add_argument("--payload", required=False)
     parser.add_argument("--payload-file", required=False)
+    parser.add_argument("--correlation-id", required=False)
     args = parser.parse_args()
 
     if args.command == "apply":

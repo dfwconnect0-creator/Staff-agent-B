@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -20,6 +21,7 @@ else:
     LOCK_PATH = Path.home() / ".local" / "state" / "staff-agent" / "watcher.lock"
 
 PENDING_OBS_PATH = Path.home() / ".local" / "state" / "staff-agent" / "pending-observations.json"
+UNCERTAIN_OBS_PATH = Path.home() / ".local" / "state" / "staff-agent" / "uncertain-observations.json"
 
 
 def now_cairo() -> str:
@@ -29,6 +31,7 @@ def now_cairo() -> str:
 def ensure_dirs():
     LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     PENDING_OBS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    UNCERTAIN_OBS_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
 def acquire_lock() -> bool:
@@ -45,6 +48,41 @@ def release_lock():
         LOCK_PATH.unlink(missing_ok=True)
     except Exception:
         pass
+
+
+def load_json(path: Path) -> list[dict]:
+    ensure_dirs()
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return []
+
+
+def save_json(path: Path, data: list[dict]):
+    ensure_dirs()
+    try:
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def clear_json(path: Path):
+    ensure_dirs()
+    try:
+        if path.exists():
+            path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+load_pending = lambda: load_json(PENDING_OBS_PATH)
+save_pending = lambda obs: save_json(PENDING_OBS_PATH, obs)
+clear_pending = lambda: clear_json(PENDING_OBS_PATH)
+load_uncertain = lambda: load_json(UNCERTAIN_OBS_PATH)
+save_uncertain = lambda obs: save_json(UNCERTAIN_OBS_PATH, obs)
+clear_uncertain = lambda: clear_json(UNCERTAIN_OBS_PATH)
 
 
 def _run_git(args: list[str], cwd: Path) -> tuple[bool, str]:
@@ -111,33 +149,6 @@ def refresh_local_repo_safely() -> dict:
     return result
 
 
-def load_pending() -> list[dict]:
-    ensure_dirs()
-    try:
-        if PENDING_OBS_PATH.exists():
-            return json.loads(PENDING_OBS_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return []
-
-
-def save_pending(observations: list[dict]):
-    ensure_dirs()
-    try:
-        PENDING_OBS_PATH.write_text(json.dumps(observations, indent=2, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
-
-
-def clear_pending():
-    ensure_dirs()
-    try:
-        if PENDING_OBS_PATH.exists():
-            PENDING_OBS_PATH.unlink(missing_ok=True)
-    except Exception:
-        pass
-
-
 def observation_digest(obs: dict) -> str:
     material = {
         "project_id": obs.get("project_id"),
@@ -176,9 +187,58 @@ def make_observation(project_id: str, report: dict) -> dict:
     }
 
 
-def dispatch_workflow(payload: dict) -> tuple[bool, str, str | None]:
+def generate_correlation_id(payload: dict) -> str:
+    blob = json.dumps(payload, sort_keys=True) + str(time.time())
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
+
+
+def find_runs_since(cutoff_seconds: int = 300) -> list[dict]:
     try:
-        payload_json = json.dumps(payload)
+        result = subprocess.run(
+            [
+                "gh",
+                "run",
+                "list",
+                "-R",
+                "dfwconnect0-creator/Staff-agent-B",
+                "--workflow",
+                "project-observation.yml",
+                "--limit",
+                "20",
+                "--json",
+                "databaseId,createdAt,status,conclusion,event,headBranch",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            return []
+        runs = json.loads(result.stdout)
+        now = datetime.now(timezone.utc)
+        recent = []
+        for r in runs:
+            try:
+                created = datetime.fromisoformat(r["createdAt"].replace("Z", "+00:00"))
+                age = (now - created).total_seconds()
+                if age <= cutoff_seconds:
+                    recent.append(r)
+            except Exception:
+                continue
+        return recent
+    except Exception:
+        return []
+
+
+def dispatch_workflow_safe(payload: dict) -> tuple[str, dict | None]:
+    """Return status: 'dispatched', 'accepted', 'no_run', 'uncertain', 'failed' and extra info."""
+    corr_id = generate_correlation_id(payload)
+    payload_with_corr = dict(payload)
+    payload_with_corr["correlation_id"] = corr_id
+
+    dispatch_failed = False
+    try:
+        payload_json = json.dumps(payload_with_corr)
         result = subprocess.run(
             [
                 "gh",
@@ -189,119 +249,28 @@ def dispatch_workflow(payload: dict) -> tuple[bool, str, str | None]:
                 "dfwconnect0-creator/Staff-agent-B",
                 "-f",
                 f"payload={payload_json}",
+                "-f",
+                f"correlation_id={corr_id}",
             ],
             capture_output=True,
             text=True,
             timeout=60,
         )
-        if result.returncode != 0:
-            return False, result.stderr or result.stdout or "dispatch failed", None
-        return True, result.stdout or "dispatched", None
+        if result.returncode == 0:
+            return "dispatched", {"correlation_id": corr_id}
+        dispatch_failed = True
     except subprocess.TimeoutExpired:
-        return False, "dispatch timeout (client)", None
-    except Exception as e:
-        return False, str(e), None
+        dispatch_failed = True
+    except Exception:
+        dispatch_failed = True
 
+    if dispatch_failed:
+        runs = find_runs_since(300)
+        if runs:
+            return "accepted", {"correlation_id": corr_id, "recent_runs": len(runs)}
+        return "no_run", {"correlation_id": corr_id}
 
-def _obs_material_equal(obs1: dict, obs2: dict) -> bool:
-    return (
-        obs1.get("fresh") == obs2.get("fresh")
-        and obs1.get("reason") == obs2.get("reason")
-        and obs1.get("facts") == obs2.get("facts")
-        and obs1.get("project_id") == obs2.get("project_id")
-    )
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--force-dispatch", action="store_true")
-    args = parser.parse_args()
-
-    if not acquire_lock():
-        print("watcher already running, exiting", file=sys.stderr)
-        return 0
-
-    try:
-        repo_state = refresh_local_repo_safely()
-        if not repo_state["ok"]:
-            if repo_state["dirty"]:
-                print(f"repo not clean, skipping: {repo_state['reason']}", file=sys.stderr)
-            else:
-                print(f"repo refresh failed: {repo_state['reason']}", file=sys.stderr)
-            return 0
-
-        sys.path.insert(0, str(REPO_ROOT))
-        import src.projects as registry
-        import src.project_sources as sources
-        import src.project_state as project_state
-        import src.events as events_log
-
-        catalog = registry.load_registry()
-        eligible = []
-        for pid, entry in catalog.items():
-            if entry.tracking != "active":
-                continue
-            if entry.evidence_source in ("event_only",):
-                continue
-            if entry.refreshable_in_actions == "no":
-                eligible.append((pid, entry))
-
-        pending = load_pending()
-        changed_observations = []
-
-        for pid, entry in eligible:
-            try:
-                report = sources.inspect(pid, entry.evidence_source, entry.evidence_path)
-            except Exception:
-                continue
-            obs = make_observation(pid, report)
-            previous = events_log.last_project_evidence(pid)
-            identical = bool(
-                previous
-                and previous.get("fresh") == obs["fresh"]
-                and previous.get("reason") == obs["reason"]
-                and previous.get("facts") == obs["facts"]
-            )
-            if not identical:
-                changed_observations.append(obs)
-
-        all_to_dispatch = list(pending)
-        for obs in changed_observations:
-            d = observation_digest(obs)
-            if not any(observation_digest(p) == d for p in all_to_dispatch):
-                all_to_dispatch.append(obs)
-
-        if args.dry_run:
-            print(json.dumps({"eligible": len(eligible), "changed": len(changed_observations), "pending": len(pending), "to_dispatch": len(all_to_dispatch)}, indent=2))
-            return 0
-
-        if not all_to_dispatch:
-            clear_pending()
-            return 0
-
-        payload = {
-            "schema_version": 1,
-            "observations": all_to_dispatch[:50],
-        }
-
-        if args.force_dispatch:
-            print(json.dumps(payload, indent=2))
-            clear_pending()
-            return 0
-
-        ok, msg, run_id = dispatch_workflow(payload)
-        if ok:
-            clear_pending()
-            print(f"dispatched {len(all_to_dispatch)} observations: {msg}")
-            return 0
-        else:
-            save_pending(all_to_dispatch)
-            print(f"dispatch failed, queued: {msg}", file=sys.stderr)
-            return 1
-    finally:
-        release_lock()
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+    runs = find_runs_since(300)
+    if runs:
+        return "accepted", {"correlation_id": corr_id, "recent_runs": len(runs)}
+    return "no_run", {"correlation_id": corr_id}
