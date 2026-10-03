@@ -1,0 +1,14 @@
+[Unit]
+Description=Staff Agent Local Project Watcher
+After=default.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/bladina/staff_agent_B
+ExecStart=/home/bladina/.local/bin/uv run -- python src/local_watcher.py
+Environment=HOME=/home/bladina
+Environment=PATH=/home/bladina/.local/bin:/usr/local/bin:/usr/bin:/bin
+TimeoutSec=300
+
+[Install]
+WantedBy=default.target

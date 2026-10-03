@@ -1,0 +1,10 @@
+[Unit]
+Description=Staff Agent Local Project Watcher Timer (every 30 min)
+
+[Timer]
+OnCalendar=*:0/30
+Persistent=true
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target
