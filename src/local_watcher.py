@@ -198,3 +198,89 @@ def dispatch_workflow(payload: dict) -> tuple[bool, str, str | None]:
         return False, "dispatch timeout (client)", None
     except Exception as e:
         return False, str(e), None
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--force-dispatch", action="store_true")
+    args = parser.parse_args()
+
+    if not acquire_lock():
+        print("watcher already running, exiting", file=sys.stderr)
+        return 0
+
+    try:
+        repo_state = refresh_local_repo_safely()
+        if not repo_state["ok"]:
+            if repo_state["dirty"]:
+                print(f"repo not clean, skipping: {repo_state['reason']}", file=sys.stderr)
+            else:
+                print(f"repo refresh failed: {repo_state['reason']}", file=sys.stderr)
+            return 0
+
+        sys.path.insert(0, str(REPO_ROOT))
+        import src.projects as registry
+        import src.project_sources as sources
+        import src.project_state as project_state
+
+        catalog = registry.load_registry()
+        eligible = []
+        for pid, entry in catalog.items():
+            if entry.tracking != "active":
+                continue
+            if entry.evidence_source in ("event_only",):
+                continue
+            if entry.refreshable_in_actions == "no":
+                eligible.append((pid, entry))
+
+        pending = load_pending()
+        changed_observations = []
+
+        for pid, entry in eligible:
+            try:
+                report = sources.inspect(pid, entry.evidence_source, entry.evidence_path)
+            except Exception:
+                continue
+            obs = make_observation(pid, report)
+            changed_observations.append(obs)
+
+        all_to_dispatch = list(pending)
+        for obs in changed_observations:
+            d = observation_digest(obs)
+            if not any(observation_digest(p) == d for p in all_to_dispatch):
+                all_to_dispatch.append(obs)
+
+        if args.dry_run:
+            print(json.dumps({"eligible": len(eligible), "changed_candidates": len(changed_observations), "pending": len(pending), "to_dispatch": len(all_to_dispatch)}, indent=2))
+            return 0
+
+        if not all_to_dispatch:
+            clear_pending()
+            return 0
+
+        payload = {
+            "schema_version": 1,
+            "observations": all_to_dispatch[:50],
+        }
+
+        if args.force_dispatch:
+            print(json.dumps(payload, indent=2))
+            clear_pending()
+            return 0
+
+        ok, msg, run_id = dispatch_workflow(payload)
+        if ok:
+            clear_pending()
+            print(f"dispatched {len(all_to_dispatch)} observations: {msg}")
+            return 0
+        else:
+            save_pending(all_to_dispatch)
+            print(f"dispatch failed, queued: {msg}", file=sys.stderr)
+            return 1
+    finally:
+        release_lock()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
