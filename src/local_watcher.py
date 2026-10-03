@@ -203,6 +203,15 @@ def dispatch_workflow(payload: dict) -> tuple[bool, str, str | None]:
         return False, str(e), None
 
 
+def _obs_material_equal(obs1: dict, obs2: dict) -> bool:
+    return (
+        obs1.get("fresh") == obs2.get("fresh")
+        and obs1.get("reason") == obs2.get("reason")
+        and obs1.get("facts") == obs2.get("facts")
+        and obs1.get("project_id") == obs2.get("project_id")
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true")
@@ -226,6 +235,7 @@ def main():
         import src.projects as registry
         import src.project_sources as sources
         import src.project_state as project_state
+        import src.events as events_log
 
         catalog = registry.load_registry()
         eligible = []
@@ -246,7 +256,15 @@ def main():
             except Exception:
                 continue
             obs = make_observation(pid, report)
-            changed_observations.append(obs)
+            previous = events_log.last_project_evidence(pid)
+            identical = bool(
+                previous
+                and previous.get("fresh") == obs["fresh"]
+                and previous.get("reason") == obs["reason"]
+                and previous.get("facts") == obs["facts"]
+            )
+            if not identical:
+                changed_observations.append(obs)
 
         all_to_dispatch = list(pending)
         for obs in changed_observations:
@@ -255,7 +273,7 @@ def main():
                 all_to_dispatch.append(obs)
 
         if args.dry_run:
-            print(json.dumps({"eligible": len(eligible), "changed_candidates": len(changed_observations), "pending": len(pending), "to_dispatch": len(all_to_dispatch)}, indent=2))
+            print(json.dumps({"eligible": len(eligible), "changed": len(changed_observations), "pending": len(pending), "to_dispatch": len(all_to_dispatch)}, indent=2))
             return 0
 
         if not all_to_dispatch:
