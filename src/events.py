@@ -272,3 +272,25 @@ def unconsumed_evidence(project_id: str) -> list[dict]:
 def last_project_evidence(project_id: str) -> dict | None:
     evidence = project_events(project_id, ("project_evidence",))
     return evidence[-1] if evidence else None
+
+
+def applied_observation_identities(project_id: str) -> set[str]:
+    """Every observation identity already applied for one project, at any time.
+
+    This is deliberately historical rather than adjacent. Comparing against only the
+    *latest* evidence event means a delayed replay of an older snapshot looks new again
+    the moment newer evidence lands in between: A, B, then a replay of A would be
+    accepted as fresh and would overwrite B's newer metadata.
+
+    Project-scoped on purpose. One project's identity never suppresses another's, even
+    when two projects' evidence hashes to the same value.
+    """
+    return {
+        e["observation_digest"]
+        for e in project_events(project_id, ("project_evidence",))
+        if isinstance(e.get("observation_digest"), str) and e["observation_digest"]
+    }
+
+
+def has_applied_observation(project_id: str, observation_digest: str) -> bool:
+    return observation_digest in applied_observation_identities(project_id)

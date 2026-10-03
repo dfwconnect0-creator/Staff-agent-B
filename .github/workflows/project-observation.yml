@@ -1,5 +1,11 @@
 name: Project Observation
 
+# The run name is the correlation mechanism. The local watcher cannot see workflow
+# inputs of runs it did not start in this process, so without a name carrying the id it
+# would have to guess which run is "its" run from timing alone. Publishing the id makes
+# the remote identity checkable: an exact string comparison decides, and nothing else.
+run-name: project-observation-${{ inputs.correlation_id }}
+
 on:
   workflow_dispatch:
     inputs:
@@ -8,8 +14,8 @@ on:
         required: true
         type: string
       correlation_id:
-        description: "Correlation ID for dispatch tracking"
-        required: false
+        description: "Correlation ID; becomes the run name so a dispatch can be matched exactly"
+        required: true
         type: string
 
 permissions:
