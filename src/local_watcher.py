@@ -34,6 +34,7 @@ from src.observation_contract import (  # noqa: E402
     SCHEMA_VERSION,
     generate_correlation_id,
     is_in_flight,
+    is_timestamp,
     is_valid_correlation_id,
     observation_identity,
     project_scoped_identity,
@@ -44,9 +45,19 @@ CAIRO_TZ = timezone(timedelta(hours=3))
 
 GITHUB_REPO = "dfwconnect0-creator/Staff-agent-B"
 OBSERVATION_WORKFLOW = "project-observation.yml"
-GITHUB_QUERY_LIMIT = 50
 DISPATCH_TIMEOUT_SECONDS = 60
 GITHUB_QUERY_TIMEOUT_SECONDS = 30
+
+# How far the search for one dispatch's exact run may reach. This is a bound on *work*,
+# not on the answer. A search ends when it has crossed the dispatch's own timestamp; the
+# page cap only decides when to admit that it could not get there.
+GITHUB_QUERY_PAGE_SIZE = 100
+GITHUB_QUERY_MAX_PAGES = 20
+
+# How long a dispatch is trusted to still be invisible. GitHub can accept a request
+# seconds before the run appears in any list, so "not listed yet" is not evidence that the
+# request never landed. Until this grace expires, the receipt stays unresolved.
+VISIBILITY_GRACE_SECONDS = 900
 
 # Match outcomes. `query_unavailable` is deliberately not `no_match`: "I could not ask"
 # and "it does not exist" lead to opposite actions, and collapsing them is how a
@@ -55,15 +66,35 @@ MATCH = "match"
 NO_MATCH = "no_match"
 QUERY_UNAVAILABLE = "query_unavailable"
 
+# A search that ran out of pages before it could prove either way. This is a third state,
+# not a flavour of `no_match`: a bounded first page that happens not to contain the run
+# proves nothing about the runs behind it, and reading it as `no_match` is what let an
+# accepted dispatch be sent again.
+SEARCH_INCOMPLETE = "search_incomplete"
+
+AUTHORITATIVE_ABSENCE_OUTCOMES = (NO_MATCH,)
+
 # Durable record states.
 STATE_DISPATCHING = "dispatching"
 STATE_UNCERTAIN = "uncertain"
 STATE_ACCEPTED = "accepted"
 STATE_PENDING = "pending"
 UNRESOLVED_STATES = (STATE_DISPATCHING, STATE_UNCERTAIN, STATE_ACCEPTED)
+ALLOWED_RECORD_STATES = (STATE_DISPATCHING, STATE_UNCERTAIN, STATE_ACCEPTED, STATE_PENDING)
 
 # Returned outcomes of a dispatch attempt.
 OUTCOME_ACKNOWLEDGED = "acknowledged"
+
+
+class CorruptRecoveryStore(ValueError):
+    """An existing recovery store that cannot be trusted to hold the whole truth.
+
+    Distinct from an empty store on purpose. A missing file means "this machine has never
+    dispatched anything", which is a complete and safe answer. A file that exists but
+    carries no records is ambiguous: it is equally the shape left behind by a write that
+    was interrupted, and treating that as an empty queue is how the same observations get
+    dispatched twice.
+    """
 
 
 def now_cairo() -> str:
@@ -152,17 +183,31 @@ def release_lock():
 def load_json(path: Path) -> list:
     """Read a JSON list, or raise.
 
-    A missing file is an empty queue. An unreadable or malformed one is an error, because
-    returning `[]` for a corrupt recovery file would silently discard every dispatch the
-    watcher still owed, which is indistinguishable from never having dispatched at all.
+    A missing file is an empty queue, because "this machine has never dispatched" is a
+    complete and provable statement. An existing file is a different claim, and each way
+    it can fail is corruption rather than emptiness:
+
+    * zero bytes or whitespace only — the exact shape an interrupted write leaves behind,
+      and indistinguishable from an intentional empty queue unless it is refused;
+    * truncated or otherwise invalid JSON;
+    * bytes that are not UTF-8.
+
+    Returning ``[]`` for any of those would silently discard every dispatch this machine
+    still owed, which is indistinguishable from never having dispatched at all — and the
+    payload is then dispatched a second time.
     """
-    ensure_dirs()
     if not path.exists():
         return []
-    text = path.read_text(encoding="utf-8")
-    if not text.strip():
-        return []
-    return json.loads(text)
+    raw = path.read_bytes()
+    if not raw.strip():
+        raise CorruptRecoveryStore(
+            f"{path} exists but holds no bytes. A store that exists and carries no "
+            "records cannot be told apart from a truncated one, so it is treated as "
+            "corruption rather than as an empty queue."
+        )
+    # `json.loads` raises JSONDecodeError and `decode` raises UnicodeDecodeError; both are
+    # ValueError subclasses, so a malformed store stops the cycle wherever it is caught.
+    return json.loads(raw.decode("utf-8"))
 
 
 def save_json(path: Path, data) -> None:
@@ -193,22 +238,89 @@ def save_json(path: Path, data) -> None:
         raise
 
 
+REQUIRED_RECORD_FIELDS = ("correlation_id", "state", "payload", "payload_digest", "created_at")
+
+
+def validate_record(record, index: int, path: Path) -> None:
+    """Refuse one persisted receipt unless every field it depends on is sound.
+
+    Being a JSON object is not enough. A record that lost a field, mistyped one, or whose
+    payload no longer hashes to its stored digest cannot be sent, cannot be matched to its
+    run, and cannot be aged against the visibility grace — so every rule that reads it
+    would be reading a guess. Each check below corresponds to one such rule:
+
+    * ``correlation_id`` names the remote run, so it must be well formed;
+    * ``created_at`` orders the record against the grace window, so it must be a real
+      timezone-aware timestamp and not merely a parseable string;
+    * ``payload_digest`` is the only evidence that the payload is the one that was
+      dispatched, so it is recomputed rather than trusted;
+    * ``state`` decides whether the payload may be sent again, so an unrecognised value is
+      refused instead of being treated as "not pending, therefore safe".
+
+    A record that fails any of these is corruption. It is not dropped, repaired, or left in
+    place to be rediscovered: the whole cycle stops, because the one thing this store is for
+    is proving what has already been sent.
+    """
+    where = f"{path}[{index}]"
+    if not isinstance(record, dict):
+        raise ValueError(f"{where} must be an object, got {type(record).__name__}")
+    for field in REQUIRED_RECORD_FIELDS:
+        if field not in record:
+            raise ValueError(f"{where} is missing required field {field!r}")
+
+    correlation_id = record["correlation_id"]
+    if not is_valid_correlation_id(correlation_id):
+        raise ValueError(f"{where} correlation_id is not a valid correlation id: {correlation_id!r}")
+
+    state = record["state"]
+    if state not in ALLOWED_RECORD_STATES:
+        raise ValueError(f"{where} state {state!r} is not one of {ALLOWED_RECORD_STATES}")
+
+    for field in ("created_at", "updated_at"):
+        value = record.get(field)
+        if value is None and field == "updated_at":
+            continue
+        if not is_timestamp(value):
+            raise ValueError(f"{where} {field} is not a timezone-aware ISO timestamp: {value!r}")
+
+    payload = record["payload"]
+    if not isinstance(payload, dict):
+        raise ValueError(f"{where} payload must be an object, got {type(payload).__name__}")
+    if not payload_is_usable(payload):
+        raise ValueError(f"{where} payload carries no sendable observations")
+
+    digest = record["payload_digest"]
+    if not isinstance(digest, str):
+        raise ValueError(f"{where} payload_digest must be a string, got {type(digest).__name__}")
+    recomputed = payload_digest(payload)
+    if digest != recomputed:
+        raise ValueError(
+            f"{where} payload_digest does not match its payload: stored {digest!r}, "
+            f"computed {recomputed!r}. The stored payload is not the payload that was dispatched."
+        )
+
+    run_id = record.get("run_id")
+    if run_id is not None and (isinstance(run_id, bool) or not isinstance(run_id, int)):
+        raise ValueError(f"{where} run_id must be an integer or null, got {run_id!r}")
+    for field in ("run_status", "run_conclusion"):
+        value = record.get(field)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"{where} {field} must be a string or null, got {value!r}")
+
+
 def load_records() -> list[dict]:
     """Read the durable store, or raise. Nothing is silently dropped or repaired.
 
-    A malformed store is not an empty queue. Treating "I cannot read my own receipts"
-    as "I owe nothing" is precisely how the same observations get dispatched twice, so
-    every shape problem surfaces here and stops the cycle instead.
+    A malformed store is not an empty queue. Treating "I cannot read my own receipts" as
+    "I owe nothing" is precisely how the same observations get dispatched twice, so every
+    shape problem surfaces here and stops the cycle instead.
     """
-    data = load_json(dispatch_records_path())
+    path = dispatch_records_path()
+    data = load_json(path)
     if not isinstance(data, list):
-        raise ValueError(f"{dispatch_records_path()} must contain a JSON list")
+        raise ValueError(f"{path} must contain a JSON list")
     for index, record in enumerate(data):
-        if not isinstance(record, dict):
-            raise ValueError(
-                f"{dispatch_records_path()}[{index}] must be an object, "
-                f"got {type(record).__name__}"
-            )
+        validate_record(record, index, path)
     return list(data)
 
 
@@ -301,12 +413,20 @@ def _run_git(args: list[str], cwd: Path) -> tuple[bool, str]:
     return True, result.stdout.strip()
 
 
-def refresh_local_repo_safely() -> dict:
+def refresh_local_repo_safely(read_only: bool = False) -> dict:
+    """Bring the working copy level with origin, unless ``read_only`` forbids it.
+
+    ``read_only`` is the dry-run contract: the repository is *inspected* with read-only
+    commands and reported, but nothing is fetched, merged, or otherwise moved. A dry run
+    that fast-forwards the checkout is not a dry run — it changes the code every later step
+    is about to be evaluated against.
+    """
     result = {
         "ok": False,
         "dirty": False,
         "was_behind": False,
         "updated": False,
+        "read_only": bool(read_only),
         "head": "",
         "origin_head": "",
         "reason": "",
@@ -333,23 +453,31 @@ def refresh_local_repo_safely() -> dict:
     ok, head = _run_git(["rev-parse", "HEAD"], cwd)
     if ok:
         result["head"] = head
-    ok, _ = _run_git(["fetch", "origin"], cwd)
-    if not ok:
-        result["reason"] = "git fetch failed"
-        return result
     ok, origin_head = _run_git(["rev-parse", "origin/main"], cwd)
     if ok:
         result["origin_head"] = origin_head
     if head and origin_head and head != origin_head:
         result["was_behind"] = True
-        ok, _ = _run_git(["merge", "--ff-only", "origin/main"], cwd)
-        if not ok:
-            result["reason"] = "ff-only failed"
+        if read_only:
+            result["reason"] = "dry run: repository is behind and was left untouched"
+            result["ok"] = True
             return result
-        result["updated"] = True
-        ok, head = _run_git(["rev-parse", "HEAD"], cwd)
+        ok, _ = _run_git(["fetch", "origin"], cwd)
+        if not ok:
+            result["reason"] = "git fetch failed"
+            return result
+        ok, origin_head = _run_git(["rev-parse", "origin/main"], cwd)
         if ok:
-            result["head"] = head
+            result["origin_head"] = origin_head
+        if head and origin_head and head != origin_head:
+            ok, _ = _run_git(["merge", "--ff-only", "origin/main"], cwd)
+            if not ok:
+                result["reason"] = "ff-only failed"
+                return result
+            result["updated"] = True
+            ok, head = _run_git(["rev-parse", "HEAD"], cwd)
+            if ok:
+                result["head"] = head
     result["ok"] = True
     return result
 
@@ -386,49 +514,47 @@ def make_observation(project_id: str, report: dict) -> dict:
 # --- exact remote correlation --------------------------------------------------
 
 
-def find_run_by_correlation(correlation_id: str) -> tuple[str, dict | None]:
-    """Resolve the ONE remote run whose identity proves it is this dispatch.
+def parse_remote_timestamp(value):
+    """A GitHub or locally persisted ISO-8601 timestamp as an aware datetime, or None.
 
-    Returns ``(MATCH, {"run_id", "status", "conclusion"})``, ``(NO_MATCH, None)`` or
-    ``(QUERY_UNAVAILABLE, None)``.
-
-    The workflow publishes ``run-name: project-observation-<correlation_id>``, so the
-    decision is an exact comparison of the expected name against each run's remote
-    display title. Run age, workflow, branch and "a run exists at all" take no part in
-    it: a nearby run carrying a different correlation id is a different dispatch, and
-    accepting it would hand one payload's failure another payload's success.
+    Naive and unparseable values are both rejected, because ordering a run against a
+    dispatch boundary is the only thing this is for and a bad reading cannot be ordered.
     """
-    expected = run_name_for(correlation_id)
-    argv = [
-        "gh",
-        "run",
-        "list",
-        "-R",
-        GITHUB_REPO,
-        "--workflow",
-        OBSERVATION_WORKFLOW,
-        "--limit",
-        str(GITHUB_QUERY_LIMIT),
-        "--json",
-        "databaseId,status,conclusion,displayTitle",
-    ]
+    if not isinstance(value, str) or not value.strip():
+        return None
     try:
-        result = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=GITHUB_QUERY_TIMEOUT_SECONDS,
-        )
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _gh_json(argv: list[str]):
+    """Run one read-only ``gh`` query. Returns parsed JSON, or None when unusable.
+
+    Every failure mode here — a non-zero exit, a timeout, a missing binary, output that is
+    not JSON, JSON of the wrong shape — is reported the same way, because they are the same
+    fact from the watcher's point of view: the question could not be answered.
+    """
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=GITHUB_QUERY_TIMEOUT_SECONDS)
     except (OSError, subprocess.SubprocessError):
-        return QUERY_UNAVAILABLE, None
+        return None
     if result.returncode != 0:
-        return QUERY_UNAVAILABLE, None
+        return None
     try:
-        runs = json.loads(result.stdout or "[]")
+        return json.loads(result.stdout or "[]")
     except (ValueError, TypeError):
-        return QUERY_UNAVAILABLE, None
-    if not isinstance(runs, list):
-        return QUERY_UNAVAILABLE, None
+        return None
+
+
+def _exact_match_in(runs, expected: str) -> tuple[str, dict | None]:
+    """The one run in ``runs`` whose published name is exactly ``expected``.
+
+    The name is compared, never inferred. A neighbouring run carrying a different
+    correlation id is a different dispatch, and accepting it would hand one payload's
+    failure another payload's success.
+    """
     for run in runs:
         if not isinstance(run, dict):
             continue
@@ -437,7 +563,7 @@ def find_run_by_correlation(correlation_id: str) -> tuple[str, dict | None]:
         run_id = run.get("databaseId")
         if run_id in (None, ""):
             # The name matched but the answer cannot identify the run, so it is not a
-            # usable answer. Reporting it as unavailable keeps us from re-sending.
+            # usable answer. Reporting it unavailable keeps us from re-sending.
             return QUERY_UNAVAILABLE, None
         return MATCH, {
             "run_id": run_id,
@@ -445,6 +571,142 @@ def find_run_by_correlation(correlation_id: str) -> tuple[str, dict | None]:
             "conclusion": run.get("conclusion"),
         }
     return NO_MATCH, None
+
+
+def view_run_by_id(correlation_id: str, run_id) -> tuple[str, dict | None]:
+    """Resolve a run from the id already stored on the receipt, without listing anything.
+
+    Once a dispatch has been seen, its run id is a complete lookup key, and the cheapest
+    correct question is the direct one. Re-deriving the answer from a recent-runs list
+    would be strictly worse: it can only ever answer "not in the newest N", which is
+    exactly the failure this removes.
+
+    The stored id is verified against the expected run name before it is trusted, so a
+    receipt carrying a stale or wrong id falls through to the search rather than adopting
+    somebody else's run.
+    """
+    if run_id in (None, ""):
+        return NO_MATCH, None
+    argv = [
+        "gh",
+        "run",
+        "view",
+        str(run_id),
+        "-R",
+        GITHUB_REPO,
+        "--json",
+        "databaseId,status,conclusion,displayTitle",
+    ]
+    answer = _gh_json(argv)
+    if not isinstance(answer, dict):
+        # Unknown run, or an answer we cannot read: fall back to the search, which is
+        # slower but can still reach a run this direct query could not.
+        return NO_MATCH, None
+    return _exact_match_in([answer], run_name_for(correlation_id))
+
+
+def list_runs_page(limit: int):
+    """One page of the workflow's runs, newest first, or None when unqueryable."""
+    answer = _gh_json(
+        [
+            "gh",
+            "run",
+            "list",
+            "-R",
+            GITHUB_REPO,
+            "--workflow",
+            OBSERVATION_WORKFLOW,
+            "--limit",
+            str(limit),
+            "--json",
+            "databaseId,status,conclusion,displayTitle,createdAt",
+        ]
+    )
+    if not isinstance(answer, list):
+        return None
+    return answer
+
+
+def find_run_by_correlation(correlation_id: str, created_at=None, run_id=None) -> tuple[str, dict | None]:
+    """Resolve the ONE remote run whose identity proves it is this dispatch.
+
+    Returns ``(MATCH, {"run_id", "status", "conclusion"})``, ``(NO_MATCH, None)``,
+    ``(QUERY_UNAVAILABLE, None)`` or ``(SEARCH_INCOMPLETE, None)``.
+
+    The workflow publishes ``run-name: project-observation-<correlation_id>``, so the
+    decision is an exact comparison of the expected name against each run's remote display
+    title. Run age, workflow, branch and "a run exists at all" take no part in it: a nearby
+    run carrying a different correlation id is a different dispatch, and accepting it would
+    hand one payload's failure another payload's success.
+
+    ``NO_MATCH`` is returned only when the search was *authoritative* — when it saw the end
+    of the workflow's history, or when every run it saw was already older than this
+    dispatch was created. A search that ran out of pages first returns
+    ``SEARCH_INCOMPLETE``, which callers must not read as permission to send again.
+    """
+    expected = run_name_for(correlation_id)
+
+    if run_id not in (None, ""):
+        outcome, run = view_run_by_id(correlation_id, run_id)
+        if outcome != NO_MATCH:
+            return outcome, run
+
+    boundary = parse_remote_timestamp(created_at)
+
+    limit = GITHUB_QUERY_PAGE_SIZE
+    for _page in range(1, GITHUB_QUERY_MAX_PAGES + 1):
+        runs = list_runs_page(limit)
+        if runs is None:
+            return QUERY_UNAVAILABLE, None
+
+        outcome, run = _exact_match_in(runs, expected)
+        if outcome != NO_MATCH:
+            return outcome, run
+
+        if len(runs) < limit:
+            # Fewer runs came back than were asked for, so the workflow's whole history
+            # has now been seen. There is nothing behind this page.
+            return NO_MATCH, None
+
+        if boundary is not None and _page_is_older_than(runs, boundary):
+            # This page reached back past the moment the dispatch was created, and the
+            # exact run was not in it. An older run cannot be this dispatch.
+            return NO_MATCH, None
+
+        limit += GITHUB_QUERY_PAGE_SIZE
+
+    return SEARCH_INCOMPLETE, None
+
+
+def _page_is_older_than(runs: list, boundary: datetime) -> bool:
+    """True when every run on this page predates the dispatch being looked for.
+
+    A run whose timestamp cannot be read is treated as *not* older, so an unreadable row
+    keeps the search going instead of manufacturing an authoritative absence.
+    """
+    if not runs:
+        return False
+    unreadable = datetime.max.replace(tzinfo=timezone.utc)
+    for run in runs:
+        if not isinstance(run, dict):
+            return False
+        created = parse_remote_timestamp(run.get("createdAt")) or unreadable
+        if not created < boundary:
+            return False
+    return True
+
+
+def visibility_grace_remaining(record: dict, now: datetime | None = None) -> float:
+    """Seconds of visibility grace this receipt has left, from its persisted timestamp.
+
+    Stored on the record rather than held in memory, so a restart cannot silently reset the
+    window and hand a still-invisible run back to the redispatch path.
+    """
+    created = parse_remote_timestamp(record.get("created_at"))
+    if created is None:
+        return 0.0
+    reference = now if now is not None else datetime.now(created.tzinfo)
+    return max(0.0, VISIBILITY_GRACE_SECONDS - (reference - created).total_seconds())
 
 
 def _run_success(conclusion) -> bool:
@@ -460,29 +722,35 @@ def _run_success(conclusion) -> bool:
 # --- durable dispatch state machine -------------------------------------------
 
 
+def settled_state(status, conclusion) -> str:
+    """The state an exact run implies. Pure: it reads the run and decides, nothing else.
+
+    Kept separate from the write so a dry run can be told what *would* happen without
+    performing any of it.
+    """
+    if is_in_flight(status):
+        return STATE_ACCEPTED
+    if _run_success(conclusion):
+        return OUTCOME_ACKNOWLEDGED
+    return STATE_PENDING
+
+
 def settle_record(record: dict, status, conclusion, run_id) -> str:
     """Reduce an exact run to the record's next state, and persist it.
 
     Returns the new state, or `acknowledged` when the record was removed.
     """
-    if is_in_flight(status):
-        record["run_status"] = status
-        record["run_conclusion"] = conclusion
-        record["run_id"] = run_id
-        record["state"] = STATE_ACCEPTED
-        record["updated_at"] = now_cairo()
-        put_record(record)
-        return STATE_ACCEPTED
-    if _run_success(conclusion):
+    state = settled_state(status, conclusion)
+    if state == OUTCOME_ACKNOWLEDGED:
         drop_record(record["correlation_id"])
         return OUTCOME_ACKNOWLEDGED
     record["run_status"] = status
     record["run_conclusion"] = conclusion
     record["run_id"] = run_id
-    record["state"] = STATE_PENDING
+    record["state"] = state
     record["updated_at"] = now_cairo()
     put_record(record)
-    return STATE_PENDING
+    return state
 
 
 def _mark_state(record: dict, state: str) -> None:
@@ -530,51 +798,70 @@ def dispatch_observations(payload: dict, superseded: list[str] | None = None) ->
     except (OSError, subprocess.SubprocessError):
         dispatched = False
 
-    outcome, run = find_run_by_correlation(correlation_id)
+    outcome, run = find_run_by_correlation(correlation_id, created_at=record["created_at"])
     if outcome == MATCH:
         state = settle_record(record, run["status"], run["conclusion"], run["run_id"])
         return state, record
-    if outcome == QUERY_UNAVAILABLE:
+    if outcome in (QUERY_UNAVAILABLE, SEARCH_INCOMPLETE):
         _mark_state(record, STATE_UNCERTAIN)
         return STATE_UNCERTAIN, record
     if dispatched:
         # GitHub accepted the request but the run is not listed yet. Leave the record
-        # unresolved so the next run resolves it by correlation id; re-sending now is
-        # the one response guaranteed to duplicate.
+        # unresolved so the next run resolves it by correlation id; re-sending now is the
+        # one response guaranteed to duplicate.
         _mark_state(record, STATE_DISPATCHING)
         return STATE_DISPATCHING, record
+    if visibility_grace_remaining(record) > 0:
+        # The transport gave no usable answer either way, and the run may still be inside
+        # GitHub's visibility delay. Holding the receipt beats re-sending on a guess.
+        _mark_state(record, STATE_UNCERTAIN)
+        return STATE_UNCERTAIN, record
     _mark_state(record, STATE_PENDING)
     return STATE_PENDING, record
 
 
-def reconcile_dispatch(record: dict, dry_run: bool = False) -> tuple[str, dict]:
+def reconcile_dispatch(record: dict, dry_run: bool = False, now: datetime | None = None) -> tuple[str, dict]:
     """Resolve exactly one durable record, by its own exact correlation id.
 
     Returns ``(next_state, record)``. ``acknowledged`` means the record was removed because
     the exact run completed successfully; ``accepted`` means it is still in flight and the
-    payload stays owned by the remote run; ``pending`` means a *reliable* lookup proved the
-    run does not exist, so the payload is safe to send again; ``uncertain`` means GitHub
-    could not be asked, which is not permission to send it again.
-    """
-    correlation_id = record.get("correlation_id")
-    if not is_valid_correlation_id(correlation_id) or not payload_is_usable(record.get("payload")):
-        # Fail closed: a receipt that cannot be sent or cannot be named is never
-        # dispatched and never deleted, because deleting it would lose the observations
-        # it stands for.
-        if not dry_run and record.get("state") != STATE_UNCERTAIN:
-            _mark_state(record, STATE_UNCERTAIN)
-        return STATE_UNCERTAIN, record
+    payload stays owned by the remote run; ``pending`` means an *authoritative* lookup
+    proved the run does not exist and the visibility grace has expired, so the payload is
+    safe to send again; ``uncertain`` means the answer is not proof of absence — GitHub
+    could not be asked, the search could not be completed, or the run may still be inside
+    the visibility window.
 
-    outcome, run = find_run_by_correlation(correlation_id)
-    if outcome == QUERY_UNAVAILABLE:
-        if not dry_run:
-            _mark_state(record, STATE_UNCERTAIN)
-        return STATE_UNCERTAIN, record
-    if outcome == NO_MATCH:
-        if not dry_run:
-            _mark_state(record, STATE_PENDING)
-        return STATE_PENDING, record
-    state = settle_record(record, run["status"], run["conclusion"], run["run_id"])
+    With ``dry_run`` the same decision is reached and none of it is performed: no state is
+    stored, no record is dropped, and what is on disk afterwards is byte-identical.
+    """
+    correlation_id = record["correlation_id"]
+    # A stored run id is a complete lookup key, so it is used directly rather than
+    # re-derived from a recent-runs list that may no longer include the run at all.
+    outcome, run = find_run_by_correlation(
+        correlation_id,
+        created_at=record.get("created_at"),
+        run_id=record.get("run_id"),
+    )
+
+    if outcome in (QUERY_UNAVAILABLE, SEARCH_INCOMPLETE):
+        state = STATE_UNCERTAIN
+    elif outcome == NO_MATCH:
+        # An authoritative absence still waits out the visibility window: a run GitHub
+        # already accepted can be missing from every list for a short while, and "not
+        # listed yet" is not "never dispatched".
+        state = STATE_UNCERTAIN if visibility_grace_remaining(record, now) > 0 else STATE_PENDING
+    else:
+        state = settled_state(run["status"], run["conclusion"])
+
+    if dry_run:
+        return state, record
+
+    if outcome == MATCH:
+        settle_record(record, run["status"], run["conclusion"], run["run_id"])
+    elif state == STATE_UNCERTAIN:
+        _mark_state(record, STATE_UNCERTAIN)
+    elif state == STATE_PENDING:
+        _mark_state(record, STATE_PENDING)
     return state, record
 
 
@@ -706,9 +993,14 @@ def main() -> int:
     parser.add_argument("--force-dispatch", action="store_true")
     args = parser.parse_args()
 
-    if not acquire_lock():
-        print("watcher already running, exiting", file=sys.stderr)
-        return 0
+    # A dry run takes no lock, because creating the lock file is itself a write and a dry
+    # run dispatches nothing that would need serialising.
+    locked = False
+    if not args.dry_run:
+        if not acquire_lock():
+            print("watcher already running, exiting", file=sys.stderr)
+            return 0
+        locked = True
 
     try:
         # Reconciliation comes first, before anything new is inspected: a dispatch this
@@ -728,7 +1020,7 @@ def main() -> int:
         if summary:
             print("reconciled: " + json.dumps(summary, sort_keys=True))
 
-        repo_state = refresh_local_repo_safely()
+        repo_state = refresh_local_repo_safely(read_only=args.dry_run)
         if not repo_state["ok"]:
             if repo_state["dirty"]:
                 print(f"repo not clean, skipping: {repo_state['reason']}", file=sys.stderr)
@@ -762,6 +1054,16 @@ def main() -> int:
                         "pending_records": len(records_in_state(records, STATE_PENDING)),
                         "unresolved_records": len(records_in_state(records, *UNRESOLVED_STATES)),
                         "would_dispatch": len(batch),
+                        "would_reconcile": {
+                            key: value for key, value in summary.items() if value
+                        },
+                        "would_retire": len(superseded),
+                        "repository": {
+                            "read_only": True,
+                            "behind": repo_state.get("was_behind", False),
+                            "fetched": False,
+                            "merged": False,
+                        },
                     },
                     indent=2,
                 )
@@ -809,7 +1111,8 @@ def main() -> int:
         )
         return 1
     finally:
-        release_lock()
+        if locked:
+            release_lock()
 
 
 if __name__ == "__main__":

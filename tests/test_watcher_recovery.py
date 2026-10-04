@@ -68,17 +68,42 @@ def test_a_timeout_after_the_exact_run_exists_does_not_dispatch_again(github):
 # --- 10: timeout, reliable no-match -> pending ---------------------------------
 
 
-def test_a_timeout_with_a_reliable_no_match_moves_the_record_to_pending(github):
+def test_a_timeout_with_a_reliable_no_match_waits_out_the_visibility_grace(github):
+    """An authoritative absence is still not immediately a licence to resend.
+
+    An empty run history really does prove no run exists, but the dispatch that timed out
+    was issued seconds earlier and GitHub can accept a request before the run shows up in
+    any listing. Treating the very first empty answer as a resend licence is the duplicate
+    dispatch this whole mechanism exists to prevent, so the receipt is held through the
+    grace window instead.
+    """
     github.make_dispatch_timeout()
 
     outcome, record = lw.dispatch_observations(build_payload([build_observation()]))
 
-    assert outcome == lw.STATE_PENDING
+    assert outcome == lw.STATE_UNCERTAIN
     stored = lw.load_records()
     assert len(stored) == 1
-    assert stored[0]["state"] == lw.STATE_PENDING
+    assert stored[0]["state"] == lw.STATE_UNCERTAIN
     assert stored[0]["payload"]["observations"][0]["project_id"] == "alpha"
     assert len(github.dispatch_calls) == 1
+
+
+def test_an_uncertain_record_becomes_pending_only_after_the_grace_expires(github):
+    """The grace is a delay, not a permanent hold: it ends in a real resend licence."""
+    from datetime import datetime, timedelta
+
+    record = lw.new_record("d" * 32, build_payload([build_observation()]))
+    record["state"] = lw.STATE_UNCERTAIN
+    lw.put_record(record)
+
+    during = lw.reconcile_dispatch(dict(record), now=datetime.fromisoformat(record["created_at"]))
+    assert during[0] == lw.STATE_UNCERTAIN
+
+    expired = datetime.fromisoformat(record["created_at"]) + timedelta(seconds=lw.VISIBILITY_GRACE_SECONDS + 1)
+    after = lw.reconcile_dispatch(dict(record), now=expired)
+    assert after[0] == lw.STATE_PENDING
+    assert lw.load_records()[0]["state"] == lw.STATE_PENDING
 
 
 # --- 11: timeout, GitHub unqueryable -> uncertain -----------------------------
@@ -181,7 +206,8 @@ def test_a_fresh_process_that_finds_the_exact_run_in_flight_keeps_the_record(git
     assert fresh["records"][0]["state"] == lw.STATE_ACCEPTED
 
 
-def test_a_fresh_process_that_finds_a_reliable_no_run_moves_it_to_pending(github, tmp_path):
+def test_a_fresh_process_that_finds_no_run_holds_the_record_through_the_grace(github, tmp_path):
+    """A restart must not reset the window that is protecting the receipt."""
     github.make_dispatch_timeout()
     lw.dispatch_observations(build_payload([build_observation()]))
 
@@ -189,9 +215,9 @@ def test_a_fresh_process_that_finds_a_reliable_no_run_moves_it_to_pending(github
         _state_dir(), RECONCILE_BODY, runs=_staged_runs(github), github_available=_github_available(github)
     )
 
-    assert fresh["summary"][lw.STATE_PENDING] == 1
+    assert fresh["summary"][lw.STATE_UNCERTAIN] == 1
     assert len(fresh["records"]) == 1
-    assert fresh["records"][0]["state"] == lw.STATE_PENDING
+    assert fresh["records"][0]["state"] == lw.STATE_UNCERTAIN
 
 
 # --- 14: reconciliation is idempotent ------------------------------------------
@@ -262,7 +288,7 @@ def test_an_unresolved_exact_run_never_gets_a_second_dispatch(github, monkeypatc
     from tests.watcher_support import sandbox_projects
 
     sandbox_projects(tmp_path, monkeypatch)
-    monkeypatch.setattr(lw, "refresh_local_repo_safely", lambda: {"ok": True, "reason": ""})
+    monkeypatch.setattr(lw, "refresh_local_repo_safely", lambda **_kwargs: {"ok": True, "reason": ""})
     monkeypatch.setattr(
         sources,
         "inspect",
@@ -290,10 +316,18 @@ def test_an_unresolved_exact_run_never_gets_a_second_dispatch(github, monkeypatc
 
 
 def test_a_pending_record_is_retried_with_a_new_correlation_id_only_once_resolved(github):
+    from datetime import datetime, timedelta
+
     github.make_dispatch_timeout()
     _, record = lw.dispatch_observations(build_payload([build_observation()]))
-    assert lw.load_records()[0]["state"] == lw.STATE_PENDING
+    assert lw.load_records()[0]["state"] == lw.STATE_UNCERTAIN
     first_id = record["correlation_id"]
+
+    # Age the receipt past its grace window, which is what actually earns the resend.
+    aged = dict(lw.load_records()[0])
+    expired = datetime.fromisoformat(aged["created_at"]) + timedelta(seconds=lw.VISIBILITY_GRACE_SECONDS + 1)
+    lw.save_records([aged])
+    assert lw.reconcile_dispatch(lw.load_records()[0], now=expired)[0] == lw.STATE_PENDING
 
     github.dispatch_calls.clear()
     records = lw.load_records()

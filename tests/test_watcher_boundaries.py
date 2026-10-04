@@ -75,7 +75,7 @@ def github(monkeypatch):
 
 def test_the_whole_cycle_makes_no_llm_call(watcher, monkeypatch, tmp_path, github):
     sandbox_projects(tmp_path, monkeypatch)
-    monkeypatch.setattr(lw, "refresh_local_repo_safely", lambda: {"ok": True, "reason": ""})
+    monkeypatch.setattr(lw, "refresh_local_repo_safely", lambda **_kwargs: {"ok": True, "reason": ""})
     import src.project_sources as sources
 
     monkeypatch.setattr(
@@ -118,7 +118,7 @@ def test_the_whole_cycle_makes_no_telegram_call(watcher, monkeypatch, tmp_path, 
     sent = []
     monkeypatch.setattr(telegram_client, "send_telegram_message", lambda *a, **k: sent.append(a))
     sandbox_projects(tmp_path, monkeypatch)
-    monkeypatch.setattr(lw, "refresh_local_repo_safely", lambda: {"ok": True, "reason": ""})
+    monkeypatch.setattr(lw, "refresh_local_repo_safely", lambda **_kwargs: {"ok": True, "reason": ""})
     github.on_dispatch(lambda corr: github.add_run(corr, 2, "queued", None))
 
     with ForbiddenImports(FORBIDDEN_IMPORTS) as guard:
@@ -159,7 +159,7 @@ def test_the_module_has_a_callable_main_that_returns_an_exit_code(github):
 
 def test_one_watcher_cycle_dispatches_exactly_one_batch(watcher, github, monkeypatch, tmp_path):
     sandbox_projects(tmp_path, monkeypatch)
-    monkeypatch.setattr(lw, "refresh_local_repo_safely", lambda: {"ok": True, "reason": ""})
+    monkeypatch.setattr(lw, "refresh_local_repo_safely", lambda **_kwargs: {"ok": True, "reason": ""})
     import src.project_sources as sources
 
     monkeypatch.setattr(
@@ -313,18 +313,30 @@ def test_a_corrupt_record_store_stops_the_watcher_before_it_dispatches(watcher, 
     lw.ensure_dirs()
     lw.dispatch_records_path().write_text("{ truncated", encoding="utf-8")
     sandbox_projects(tmp_path, monkeypatch)
-    monkeypatch.setattr(lw, "refresh_local_repo_safely", lambda: {"ok": True, "reason": ""})
+    monkeypatch.setattr(lw, "refresh_local_repo_safely", lambda **_kwargs: {"ok": True, "reason": ""})
 
     assert run_watcher_main(monkeypatch) == 1
     assert github.dispatch_calls == [], "a corrupt recovery store still sent observations"
 
 
 def test_an_unreadable_record_is_never_silently_dropped(watcher):
+    """A record that cannot be interpreted stops the cycle, and is still on disk after.
+
+    The store is the only proof of what this machine already sent. When one entry of it is
+    unreadable, the honest response is to refuse to act on any of it — not to drop the bad
+    entry, which would free the observations it stands for to be rediscovered and sent
+    again, and not to carry on with the entries that happen to parse.
+    """
     good = lw.new_record("a" * 32, build_payload([build_observation()]))
     lw.save_json(lw.dispatch_records_path(), [good, {"correlation_id": "broken", "state": "dispatching"}])
-    lw.reconcile_records()
-    stored = {record.get("correlation_id") for record in lw.load_records()}
-    assert "broken" in stored, "a receipt that could not be interpreted was deleted"
+    before = lw.dispatch_records_path().read_text(encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        lw.reconcile_records()
+
+    assert lw.dispatch_records_path().read_text(encoding="utf-8") == before, (
+        "a refused store must be left exactly as it was found"
+    )
 
 
 # --- payload transport is not shell code -----------------------------------------
@@ -429,7 +441,7 @@ def test_a_dry_run_inspects_the_registered_local_projects_and_dispatches_nothing
     watcher, github, monkeypatch, tmp_path, capsys
 ):
     sandbox_projects(tmp_path, monkeypatch)
-    monkeypatch.setattr(lw, "refresh_local_repo_safely", lambda: {"ok": True, "reason": ""})
+    monkeypatch.setattr(lw, "refresh_local_repo_safely", lambda **_kwargs: {"ok": True, "reason": ""})
     import src.project_sources as sources
 
     inspected = []
@@ -458,6 +470,9 @@ def test_a_dry_run_inspects_the_registered_local_projects_and_dispatches_nothing
         "pending_records": 0,
         "unresolved_records": 0,
         "would_dispatch": 2,
+        "would_reconcile": {},
+        "would_retire": 0,
+        "repository": {"read_only": True, "behind": False, "fetched": False, "merged": False},
     }
     assert github.dispatch_calls == []
     assert not lw.dispatch_records_path().exists(), "a dry run wrote durable state"
@@ -472,7 +487,7 @@ def test_a_dry_run_does_not_settle_an_unresolved_record(watcher, monkeypatch, tm
     lw.put_record(record)
 
     sandbox_projects(tmp_path, monkeypatch)
-    monkeypatch.setattr(lw, "refresh_local_repo_safely", lambda: {"ok": True, "reason": ""})
+    monkeypatch.setattr(lw, "refresh_local_repo_safely", lambda **_kwargs: {"ok": True, "reason": ""})
     assert run_watcher_main(monkeypatch, argv=["local_watcher.py", "--dry-run"]) == 0
 
     assert lw.load_records()[0]["state"] == lw.STATE_UNCERTAIN
@@ -482,7 +497,7 @@ def test_a_dry_run_does_not_settle_an_unresolved_record(watcher, monkeypatch, tm
 def test_a_dirty_worktree_stops_the_cycle_without_dispatching(watcher, github, monkeypatch, tmp_path):
     sandbox_projects(tmp_path, monkeypatch)
     monkeypatch.setattr(
-        lw, "refresh_local_repo_safely", lambda: {"ok": False, "dirty": True, "reason": "worktree has local modifications"}
+        lw, "refresh_local_repo_safely", lambda **_kwargs: {"ok": False, "dirty": True, "reason": "worktree has local modifications"}
     )
     assert run_watcher_main(monkeypatch) == 0
     assert github.dispatch_calls == []
@@ -534,7 +549,7 @@ def test_the_correlation_id_the_watcher_sends_matches_the_one_in_the_payload(wat
 
 def test_a_force_dispatch_preview_is_also_an_applicable_payload(watcher, github, monkeypatch, tmp_path, capsys):
     sandbox_projects(tmp_path, monkeypatch)
-    monkeypatch.setattr(lw, "refresh_local_repo_safely", lambda: {"ok": True, "reason": ""})
+    monkeypatch.setattr(lw, "refresh_local_repo_safely", lambda **_kwargs: {"ok": True, "reason": ""})
     assert run_watcher_main(monkeypatch, argv=["local_watcher.py", "--force-dispatch"]) == 0
     payload = json_after_reconcile(capsys.readouterr().out)
     import src.projects as registry
